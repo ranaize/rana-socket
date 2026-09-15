@@ -53,6 +53,7 @@ class Status(object):
     INVALID_PAYLOAD = 4
     FORBIDDEN = 5
     SAFETY_GATE_FAILED = 6
+    FORWARD_TO_CLIENT = 7
 
 
 class McServerCmd(object):

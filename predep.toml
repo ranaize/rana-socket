@@ -8,13 +8,6 @@ sha256 = "6b5172ad4dd6519aec67b919181fa7a38a2234131e5b2afa232dfe444819783e"
 dest = "root://vendor/"
 create_directory = true
 
-[[vendor]]
-name = "flatbuffers"
-url = "https://github.com/google/flatbuffers/archive/refs/tags/v24.3.25.tar.gz"
-sha256 = "4157c5cacdb59737c5d627e47ac26b140e9ee28b1102f812b36068aab728c1ed"
-dest = "root://vendor/flatbuffers/"
-create_directory = true
-
 [[stages]]
 name = "vendor"
 type = "vendor"

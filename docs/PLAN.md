@@ -1,3 +1,5 @@
+1. Next step you flagged: removing the variant field in dispatch_inner. One wrinkle — browser → LaunchBrowser     Cmd isn't a pure key + "Cmd" (it's Launch + Browser + Cmd), so deriving the variant needs a tiny {"speak":"Sp     eakCmd", "browser":"LaunchBrowserCmd", "lights":"LightCmd", "power":"PowerCmd"} map, not a string concat. Wan     t me to do that now?
+
 # Enhancement Plan: Scriptable Command System for rana-socket
 
 ## Overview

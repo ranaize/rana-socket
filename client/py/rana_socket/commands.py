@@ -9,6 +9,7 @@ package and is produced by:
     flatc --gen-onefile --python -o schema/generated schema/command.fbs
 """
 
+import base64
 import socket
 import struct
 
@@ -47,6 +48,7 @@ STATUS_NAMES = {
     fb.Status.INVALID_PAYLOAD: "INVALID_PAYLOAD",
     fb.Status.FORBIDDEN: "FORBIDDEN",
     fb.Status.SAFETY_GATE_FAILED: "SAFETY_GATE_FAILED",
+    fb.Status.FORWARD_TO_CLIENT: "FORWARD_TO_CLIENT",
 }
 
 
@@ -194,14 +196,29 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def send(sock: socket.socket, payload: bytes) -> dict:
-    """Sends one framed command, returns the daemon's decoded response."""
+    """Sends one framed command, returns the daemon's decoded response.
+
+    A response may instead be a forward directive: status FORWARD_TO_CLIENT
+    (7) means the daemon could not run the command locally and has base64-
+    encoded the inner Command in the message for the caller to relay elsewhere.
+    """
     sock.sendall(struct.pack(">I", len(payload)) + payload)
     length = struct.unpack(">I", _recv_exact(sock, 4))[0]
     resp_bytes = _recv_exact(sock, length)
     r = fb.Response.GetRootAsResponse(resp_bytes, 0)
+    status = r.Status()
+    if status == fb.Status.FORWARD_TO_CLIENT:
+        return {
+            "request_id": r.RequestId(),
+            "status": status,
+            "status_name": "FORWARD_TO_CLIENT",
+            "forward": True,
+            "command": base64.b64decode(r.Message()),
+        }
     return {
         "request_id": r.RequestId(),
-        "status": r.Status(),
-        "status_name": STATUS_NAMES.get(r.Status(), str(r.Status())),
+        "status": status,
+        "status_name": STATUS_NAMES.get(status, str(status)),
         "message": (r.Message() or b"").decode(),
+        "forward": False,
     }

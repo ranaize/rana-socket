@@ -210,48 +210,61 @@ static bool read_ask_reply(const std::string& buf, std::string& action, std::str
 
 }  // namespace
 
-Result Executor::run(const Command* cmd) {
-    if (cmd == nullptr) return {Status_INVALID_PAYLOAD, "empty payload"};
+namespace {
+
+// RFC4648 base64 (no newline). Embeds a forwarded Command inside a
+// Response.message so the reply stays a single, always-parseable Response.
+static const char kBase64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string base64_encode(const std::vector<uint8_t>& in) {
+    std::string out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 2 < in.size()) {
+        uint32_t n = (uint32_t(in[i]) << 16) | (uint32_t(in[i + 1]) << 8) | uint32_t(in[i + 2]);
+        out.push_back(kBase64[(n >> 18) & 63]);
+        out.push_back(kBase64[(n >> 12) & 63]);
+        out.push_back(kBase64[(n >> 6) & 63]);
+        out.push_back(kBase64[n & 63]);
+        i += 3;
+    }
+    size_t rem = in.size() - i;
+    if (rem == 1) {
+        uint32_t n = uint32_t(in[i]) << 16;
+        out.push_back(kBase64[(n >> 18) & 63]);
+        out.push_back(kBase64[(n >> 12) & 63]);
+        out.push_back('=');
+        out.push_back('=');
+    } else if (rem == 2) {
+        uint32_t n = (uint32_t(in[i]) << 16) | (uint32_t(in[i + 1]) << 8);
+        out.push_back(kBase64[(n >> 18) & 63]);
+        out.push_back(kBase64[(n >> 12) & 63]);
+        out.push_back(kBase64[(n >> 6) & 63]);
+        out.push_back('=');
+    }
+    return out;
+}
+
+}  // namespace
+
+RunOutcome Executor::run(const Command* cmd) {
+    if (cmd == nullptr) { RunOutcome o; o.result = {Status_INVALID_PAYLOAD, "empty payload"}; return o; }
 
     switch (cmd->payload_type()) {
-        case CommandPayload_McServerCmd:
-            return run_mc_server(cmd->payload_as<McServerCmd>());
-
-        case CommandPayload_VolumeCmd:
-            return run_volume(cmd->payload_as<VolumeCmd>());
-
-        case CommandPayload_PowerCmd:
-            return run_power(cmd->payload_as<PowerCmd>());
-
-        case CommandPayload_PlayMovieCmd:
-            return run_play_movie(cmd->payload_as<PlayMovieCmd>());
-
-        case CommandPayload_LaunchBrowserCmd:
-            return run_browser(cmd->payload_as<LaunchBrowserCmd>());
-
-        case CommandPayload_MediaCmd:
-            return run_media(cmd->payload_as<MediaCmd>());
-
-        case CommandPayload_LookupMachineCmd:
-            return run_lookup(cmd->payload_as<LookupMachineCmd>());
-
-        case CommandPayload_SpeakCmd:
-            return run_speak(cmd->payload_as<SpeakCmd>());
-
-        case CommandPayload_LightCmd:
-            return run_light(cmd->payload_as<LightCmd>());
-
-        case CommandPayload_AskCmd:
-            return run_ask(cmd->payload_as<AskCmd>());
-
-        case CommandPayload_TalkCmd:
-            return run_talk(cmd->payload_as<TalkCmd>());
-
-        case CommandPayload_NONE:
-            return {Status_INVALID_PAYLOAD, "empty payload"};
-
-        default:
-            return {Status_UNKNOWN_COMMAND, "unsupported union variant"};
+        case CommandPayload_McServerCmd: { RunOutcome o; o.result = run_mc_server(cmd->payload_as<McServerCmd>()); return o; }
+        case CommandPayload_VolumeCmd:   { RunOutcome o; o.result = run_volume(cmd->payload_as<VolumeCmd>()); return o; }
+        case CommandPayload_PowerCmd:    { RunOutcome o; o.result = run_power(cmd->payload_as<PowerCmd>()); return o; }
+        case CommandPayload_PlayMovieCmd:{ RunOutcome o; o.result = run_play_movie(cmd->payload_as<PlayMovieCmd>()); return o; }
+        case CommandPayload_LaunchBrowserCmd: { RunOutcome o; o.result = run_browser(cmd->payload_as<LaunchBrowserCmd>()); return o; }
+        case CommandPayload_MediaCmd:    { RunOutcome o; o.result = run_media(cmd->payload_as<MediaCmd>()); return o; }
+        case CommandPayload_LookupMachineCmd: { RunOutcome o; o.result = run_lookup(cmd->payload_as<LookupMachineCmd>()); return o; }
+        case CommandPayload_SpeakCmd:    { RunOutcome o; o.result = run_speak(cmd->payload_as<SpeakCmd>()); return o; }
+        case CommandPayload_LightCmd:    { RunOutcome o; o.result = run_light(cmd->payload_as<LightCmd>()); return o; }
+        case CommandPayload_AskCmd:      { RunOutcome o; o.result = run_ask(cmd->payload_as<AskCmd>()).result; return o; }
+        case CommandPayload_TalkCmd:     { RunOutcome o; o.result = run_talk(cmd->payload_as<TalkCmd>()); return o; }
+        case CommandPayload_NONE:        { RunOutcome o; o.result = {Status_INVALID_PAYLOAD, "empty payload"}; return o; }
+        default:                         { RunOutcome o; o.result = {Status_UNKNOWN_COMMAND, "unsupported union variant"}; return o; }
     }
 }
 
@@ -259,6 +272,17 @@ std::vector<uint8_t> Executor::build_response(uint64_t request_id, const Result&
     flatbuffers::FlatBufferBuilder b(256);
     const auto msg = b.CreateString(r.message);
     const auto resp = CreateResponse(b, request_id, r.status, msg);
+    b.Finish(resp);
+    return {b.GetBufferPointer(), b.GetBufferPointer() + b.GetSize()};
+}
+
+std::vector<uint8_t> Executor::build_forward_response(uint64_t request_id,
+                                                     const std::vector<uint8_t>& cmd) const {
+    // Tells the client to run `cmd` on another socket. The inner Command is
+    // base64-encoded into the message so the reply is still a single Response.
+    flatbuffers::FlatBufferBuilder b(256);
+    const auto msg = b.CreateString(base64_encode(cmd));
+    const auto resp = CreateResponse(b, request_id, Status_FORWARD_TO_CLIENT, msg);
     b.Finish(resp);
     return {b.GetBufferPointer(), b.GetBufferPointer() + b.GetSize()};
 }
@@ -441,39 +465,39 @@ Result Executor::run_light(const LightCmd* cmd) {
     return to_result(spawn_process("", {entry->binary, action, room}, {}, entry->timeout_ms));
 }
 
-Result Executor::run_ask(const AskCmd* cmd) {
+RunOutcome Executor::run_ask(const AskCmd* cmd) {
     // The daemon is the ONLY caller that may reach the LLM hop: it holds the
     // previously-unreachable ("asked") authority and never forwards it outward.
-    if (cmd == nullptr) return {Status_INVALID_PAYLOAD, "bad payload"};
-    if (cmd->text() == nullptr) return {Status_INVALID_PAYLOAD, "no text"};
+    if (cmd == nullptr) { RunOutcome o; o.result = {Status_INVALID_PAYLOAD, "bad payload"}; return o; }
+    if (cmd->text() == nullptr) { RunOutcome o; o.result = {Status_INVALID_PAYLOAD, "no text"}; return o; }
     return run_ask_text(cmd->text()->str());
 }
 
-Result Executor::run_ask_text(const std::string& text) {
+RunOutcome Executor::run_ask_text(const std::string& text) {
     Result fail;
     const CommandEntry* entry = lookup("ask", "AskCmd", fail);
-    if (entry == nullptr) return fail;
+    if (entry == nullptr) { RunOutcome o; o.result = fail; return o; }
 
     // script-type config fills `path`; fall back to `binary` if unset.
     // The question rides as argv[1] — never via a shell. The config path is
     // forwarded so the ask hop can build its system prompt from [commands].
     const std::string& exe = entry->path.empty() ? entry->binary : entry->path;
-    if (exe.empty()) return {Status_EXECUTION_FAILED, "ask not configured with a binary/path"};
+    if (exe.empty()) { RunOutcome o; o.result = {Status_EXECUTION_FAILED, "ask not configured with a binary/path"}; return o; }
 
     const std::vector<std::string> env = {"RANA_CONFIG=" + cfg_.path};
     const std::vector<std::string> argv = {exe, text};
     SpawnResult sr = spawn_process("", argv, env, entry->timeout_ms, /*capture_stdout=*/true);
-    if (sr.spawn_failed) return {Status_EXECUTION_FAILED, "ask hop spawn failed"};
-    if (sr.timed_out)    return {Status_EXECUTION_FAILED, "ask hop timed out"};
+    if (sr.spawn_failed) { RunOutcome o; o.result = {Status_EXECUTION_FAILED, "ask hop spawn failed"}; return o; }
+    if (sr.timed_out)    { RunOutcome o; o.result = {Status_EXECUTION_FAILED, "ask hop timed out"}; return o; }
     if (sr.exit_code != 0) {
         std::string msg = "ask hop exit " + std::to_string(sr.exit_code);
         if (!sr.stderr_text.empty()) msg += ": " + sr.stderr_text;
-        return {Status_EXECUTION_FAILED, msg};
+        RunOutcome o; o.result = {Status_EXECUTION_FAILED, msg}; return o;
     }
 
     std::string action, payload;
     if (!read_ask_reply(sr.stdout_text, action, payload)) {
-        return {Status_EXECUTION_FAILED, "ask hop returned an invalid AskReply buffer"};
+        RunOutcome o; o.result = {Status_EXECUTION_FAILED, "ask hop returned an invalid AskReply buffer"}; return o;
     }
     return dispatch_inner(action, payload);
 }
@@ -530,61 +554,89 @@ Result Executor::run_talk(const TalkCmd* cmd) {
     std::string transcript = sr.stdout_text;
     while (!transcript.empty() && std::isspace(static_cast<unsigned char>(transcript.back())))
         transcript.pop_back();
-    return run_ask_text(transcript);
+    return run_ask_text(transcript).result;
 }
 
 // Re-dispatch the LLM-routed action internally. The reply text from the hop is
 // whatever LocalAI classified; we map it back onto a strongly-typed Command so
 // the SAME executor path (and SAME config gate) handles it. No LLM output ever
 // leaves the daemon.
-Result Executor::dispatch_inner(const std::string& action, const std::string& payload) {
+RunOutcome Executor::dispatch_inner(const std::string& action, const std::string& payload) {
     flatbuffers::FlatBufferBuilder b(256);
     CommandPayload type = CommandPayload_NONE;
     flatbuffers::Offset<void> up;
+    // [commands.<key>] used to test whether THIS daemon owns the command.
+    std::string cfg_key;
+    const char* variant = nullptr;
 
     if (action == "reply") {
         up = CreateSpeakCmd(b, b.CreateString(payload)).Union();
         type = CommandPayload_SpeakCmd;
+        cfg_key = "speak"; variant = "SpeakCmd";
     } else if (action == "open_browser") {
         up = CreateLaunchBrowserCmd(b, b.CreateString(payload)).Union();
         type = CommandPayload_LaunchBrowserCmd;
+        cfg_key = "browser"; variant = "LaunchBrowserCmd";
     } else if (action == "search_web") {
         std::string q = payload;
         for (char& c : q) if (c == ' ') c = '+';
         up = CreateLaunchBrowserCmd(b, b.CreateString("https://duckduckgo.com/?q=" + q)).Union();
         type = CommandPayload_LaunchBrowserCmd;
+        cfg_key = "browser"; variant = "LaunchBrowserCmd";
     } else if (action == "toggle_lights") {
         up = CreateLightCmd(b, b.CreateString(payload), LightAction_Toggle).Union();
         type = CommandPayload_LightCmd;
+        cfg_key = "lights"; variant = "LightCmd";
     } else if (action == "shutdown") {
         up = CreatePowerCmd(b, PowerAction_Shutdown, /*confirm=*/true).Union();
         type = CommandPayload_PowerCmd;
+        cfg_key = "power"; variant = "PowerCmd";
     } else {
-        return {Status_UNKNOWN_COMMAND, "ask returned unknown action: " + action};
+        RunOutcome o; o.result = {Status_UNKNOWN_COMMAND, "ask returned unknown action: " + action};
+        return o;
     }
 
     const auto cmd_off = CreateCommand(b, /*request_id=*/0, type, up);
     b.Finish(cmd_off);
-    const Command* inner = GetCommand(b.GetBufferPointer());
-    return run(inner);
+    std::vector<uint8_t> inner(b.GetBufferPointer(), b.GetBufferPointer() + b.GetSize());
+
+    // Run locally only if this daemon has the command mapped; otherwise forward
+    // the typed Command back to the client (socket 1) for execution there.
+    Result fail;
+    const CommandEntry* entry = lookup(cfg_key, variant, fail);
+    if (entry == nullptr) {
+        RunOutcome fwd;
+        fwd.forward_to_client = true;
+        fwd.forward_cmd = std::move(inner);
+        return fwd;
+    }
+    const Command* inner_cmd = GetCommand(inner.data());
+    RunOutcome o;
+    o.result = run(inner_cmd).result;
+    return o;
 }
 
 void handle_connection(int fd, Executor& exec) {
     std::string frame;
     while (read_frame(fd, frame)) {
-        Result r;
+        RunOutcome outcome;
         uint64_t request_id = 0;
 
         flatbuffers::Verifier v(reinterpret_cast<const uint8_t*>(frame.data()), frame.size());
         if (VerifyCommandBuffer(v)) {
             const Command* cmd = GetCommand(frame.data());
             request_id = cmd->request_id();
-            r = exec.run(cmd);
+            outcome = exec.run(cmd);
         } else {
-            r = {Status_INVALID_PAYLOAD, "malformed flatbuffer"};
+            outcome.result = {Status_INVALID_PAYLOAD, "malformed flatbuffer"};
         }
 
-        const auto resp = exec.build_response(request_id, r);
+        std::vector<uint8_t> resp;
+        if (outcome.forward_to_client) {
+            resp = exec.build_forward_response(request_id, outcome.forward_cmd);
+        } else {
+            resp = exec.build_response(request_id, outcome.result);
+        }
         if (!write_frame(fd, resp.data(), static_cast<uint32_t>(resp.size()))) break;
     }
 }

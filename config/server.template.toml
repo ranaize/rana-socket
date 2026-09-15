@@ -1,0 +1,46 @@
+# rana-deploy rana-socket config — container world (canonical default).
+# Mounted read-only into the rana-socketd container at /etc/rana/rana-socket.toml
+# (see rana-deploy/docker-compose.yaml). Command set is a superset of the
+# bare-metal notebook config: it keeps the host-tied commands
+# (mc_server/power/play_movie/lookup_machine) AND adds the re-dispatch targets
+# (speak/lights/browser) the ask hop routes into. The host-tied commands need
+# container-available equivalents before they run here; speak/lights/browser
+# need their executors present in the image (espeak-ng, rana-lights.sh, xdg-open).
+
+[daemon]
+socket_type = "tcp"
+bind_address = "0.0.0.0"
+port = 9000
+# The bridge subnet LocalAI + socketd share (rana_server_net). The daemon only
+# accepts frames from these peers; everything else is closed on accept.
+allowed_ips = ["172.28.0.0/16"]
+
+[commands.mc_server]
+variant = "McServerCmd"
+type = "docker_compose"
+workdir = "/opt/minecraft"
+default_world = "survival"
+
+# [commands.power]
+# variant = "PowerCmd"
+# type = "system"
+# binary = "/usr/bin/dinitctl"
+# suspend_binary = "/usr/bin/zzz"
+# requires_confirm = true
+
+# The daemon is the ONLY LocalAI caller. AskCmd.text rides here to the ask hop
+# script over the socket en route to localai:8080 (ASK_LLM_URL).
+[commands.ask]
+variant = "AskCmd"
+type = "script"
+path = "/usr/local/bin/rana-ask.sh"
+# TEXT passed via argv, never a shell.
+timeout_ms = 30000
+
+# On-server STT for TalkCmd. The daemon decodes the audio (libranasocketaudio)
+# to a WAV and hands it to this hop; the transcript is routed through the ask hop.
+[stt]
+script = "/usr/local/bin/rana-stt.sh"
+url = "http://localai:8080"
+model = "talk"
+timeout_ms = 30000

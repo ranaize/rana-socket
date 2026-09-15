@@ -97,7 +97,10 @@ enum Status : byte {
     EXECUTION_FAILED = 3,
     INVALID_PAYLOAD = 4,
     FORBIDDEN = 5,
-    SAFETY_GATE_FAILED = 6              // e.g. PowerCmd.confirm == false
+    SAFETY_GATE_FAILED = 6,             // e.g. PowerCmd.confirm == false
+    FORWARD_TO_CLIENT = 7               // daemon can't run the command locally; the
+                                        // Response.message carries base64(inner Command)
+                                        // for the client to forward to another socket
 }
 
 table Response {

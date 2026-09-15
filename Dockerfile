@@ -6,7 +6,9 @@
 # carries scripts/rana-ask.sh (the LLM hop).
 
 ############################ builder ############################
-FROM debian:12@sha256:2f65600e1252c5649d2213e1d1ea4d74253d26514dc6530102a875e429245929 AS builder
+# trixie (glibc 2.41 / GLIBCXX_3.4.32) is required: the `predep` release binary
+# needs GLIBC_2.38+, which bookworm (2.36) does not provide.
+FROM debian:trixie-20260824-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential g++ cmake git curl ca-certificates \
@@ -30,6 +32,10 @@ RUN curl -fsSL "https://github.com/10per5/predep/releases/latest/download/predep
 
 # flatc (flatbuffers compiler) v24.3.25 — same pin as predep.toml; consumed by
 # the premake gen_schema_client prebuild to generate the FlatBuffers headers.
+# Also install the matching flatbuffers runtime headers to /usr/local/include so
+# the daemon/client/serializer compiles find "flatbuffers/flatbuffers.h" without
+# depending on a system flatbuffers package or predep's (often-empty) vendored
+# copy. Using the same source as flatc keeps the version exact.
 ARG FLATBUFFERS_VER=24.3.25
 RUN curl -fsSL "https://github.com/google/flatbuffers/archive/refs/tags/v${FLATBUFFERS_VER}.tar.gz" -o /tmp/fb.tgz \
     && mkdir -p /tmp/fb && tar -xzf /tmp/fb.tgz -C /tmp/fb \
@@ -37,10 +43,19 @@ RUN curl -fsSL "https://github.com/google/flatbuffers/archive/refs/tags/v${FLATB
     -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_TESTS=OFF -DFLATBUFFERS_BUILD_FLATC=ON \
     && cmake --build /tmp/fb/build -j"$(nproc)" --target flatc \
     && install -m 0755 /tmp/fb/build/flatc /usr/local/bin/flatc \
+    && mkdir -p /usr/local/include/flatbuffers \
+    && cp -r "/tmp/fb/flatbuffers-${FLATBUFFERS_VER}/include/flatbuffers/." /usr/local/include/flatbuffers/ \
     && rm -rf /tmp/fb /tmp/fb.tgz
 
 WORKDIR /src
 COPY . .
+
+# predep refuses to run as root. Create a normal build user and run it as that
+# user; predep only self-sudo's for install/uninstall stages, which the build
+# stage does not use.
+RUN useradd -m -s /bin/bash bldr && chown -R bldr /src
+USER bldr
+ENV HOME=/home/bldr
 
 # Vendor dependencies and build the statically-linked daemon + ask-hop encoder
 # via predep (stages declared in predep.toml: `main` = `build` depends on
@@ -48,7 +63,7 @@ COPY . .
 RUN predep
 
 ############################ runtime ############################
-FROM debian:12-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867 AS runtime
+FROM debian:bookworm-20260824-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates jq espeak-ng python3 \
     && rm -rf /var/lib/apt/lists/*

@@ -28,7 +28,7 @@ Produces `bin/Release/rana-socketd`.
 ## Running
 
 ```sh
-bin/Release/rana-socketd ../rana-deploy/config/rana-socket.toml
+bin/Release/rana-socketd ../rana-deploy/config/server.toml
 ```
 
 It needs a `rana-socket.toml` config path as its sole argument. JSON-like stderr is
@@ -137,5 +137,5 @@ Key `[daemon]` options (all optional, with defaults):
 | `allowed_ips`        | *(empty)*          | allow-list for TCP peers               |
 
 Command entries live under `[commands.*]` and are dispatched by their union
-type; see `rana-deploy/config/notebook_services.toml` for examples and
+type; see `rana-deploy/config/client.toml` for examples and
 `schema/command.fbs` for the command vocabulary.
