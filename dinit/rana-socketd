@@ -1,0 +1,7 @@
+type = process
+command = /usr/local/bin/rana-socketd /etc/rana/rana-socket.toml
+run-as = rana-exec
+restart = true
+smooth-recovery = true
+logfile = /var/log/rana-socketd.log
+depends-on = network

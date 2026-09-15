@@ -1,0 +1,41 @@
+main = "build"
+project = "rana-socketd"
+
+[[vendor]]
+name = "tomlplusplus"
+url = "https://raw.githubusercontent.com/marzer/tomlplusplus/v3.4.0/toml.hpp"
+sha256 = "6b5172ad4dd6519aec67b919181fa7a38a2234131e5b2afa232dfe444819783e"
+dest = "root://vendor/"
+create_directory = true
+
+[[vendor]]
+name = "flatbuffers"
+url = "https://github.com/google/flatbuffers/archive/refs/tags/v24.3.25.tar.gz"
+sha256 = "4157c5cacdb59737c5d627e47ac26b140e9ee28b1102f812b36068aab728c1ed"
+dest = "root://vendor/flatbuffers/"
+create_directory = true
+
+[[stages]]
+name = "vendor"
+type = "vendor"
+
+[[stages]]
+name = "build"
+type = "premake5"
+depends = ["vendor"]
+clean = true
+outputs = ["root://socket/bin/Release/rana-socketd"]
+
+[[stages]]
+name = "clean"
+type = "clean"
+targets = ["build"]
+paths = [
+  "root://socket/bin",
+  "root://socket/obj",
+  "root://serializer/bin",
+  "root://serializer/obj",
+  "root://serializer/lib",
+  "root://client/cpp/bin",
+  "root://client/cpp/obj",
+]

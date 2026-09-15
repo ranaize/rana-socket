@@ -1,0 +1,17 @@
+namespace rana;
+
+// AskReply — the structured result of the LLM ask hop.
+//
+// rana-ask.sh queries LocalAI (OpenAI-compatible JSON) and lets rana-ask-encode
+// translate that JSON into this binary FlatBuffer, which it writes to stdout.
+// rana-socketd verifies the buffer and reads the two fields; the daemon never
+// parses JSON itself.
+//
+// `action` is one of the keywords the tower's command model is prompted to emit
+// (see scripts/rana-ask.sh); `payload` is that action's argument — the spoken
+// text for "reply", the query for "search_web", "" otherwise.
+table AskReply {
+    action:string;
+    payload:string;
+}
+root_type AskReply;

@@ -1,0 +1,109 @@
+namespace rana;
+
+// ─── Shared enums ────────────────────────────────────────────────
+enum McAction : byte { Start = 0, Stop = 1, Restart = 2 }
+enum PowerAction : byte { Shutdown = 0, Standby = 1, Reboot = 2 }
+enum MediaAction : byte { Play = 0, Pause = 1, PlayPause = 2, Stop = 3 }
+enum LightAction : byte { Toggle = 0, On = 1, Off = 2 }
+
+// ─── Per-command strongly-typed payloads ─────────────────────────
+table McServerCmd {
+    action:McAction;                    // daemon validates value at dispatch
+    world_name:string;                  // optional; daemon uses TOML default if absent
+}
+
+table VolumeCmd {
+    level:uint8;                        // 0..100
+    mute:bool;
+}
+
+table PowerCmd {
+    action:PowerAction;                 // daemon validates value at dispatch
+    confirm:bool;                       // hard safety gate; daemon rejects if false
+}
+
+table PlayMovieCmd {
+    path:string (required);
+    start_seconds:uint64;
+}
+
+table LaunchBrowserCmd {
+    url:string;                         // optional; daemon uses TOML default if absent
+}
+
+table MediaCmd {
+    action:MediaAction;                 // daemon validates value at dispatch
+    target:string;                      // e.g. "kodi", "mpv"; maps to TOML key
+}
+
+table LookupMachineCmd {
+    subnet:string;                      // e.g. "192.168.1.0/24"
+    timeout_ms:uint32;
+}
+
+table SpeakCmd {
+    text:string (required);             // text to speak aloud (reply)
+}
+
+// AskCmd — send text to the tower's LocalAI and get a routed, spoken reply
+// back (the LLM hop). The daemon is the ONLY caller of LocalAI (bridge hop
+// http://localai:8080), so reply text is whatever LocalAI routes for it.
+table AskCmd {
+    text:string (required);             // text to ask the home LLM (LLM hop)
+}
+
+// TalkCmd — stream a captured utterance to the daemon for on-server STT.
+// The (untrusted) client sends only raw audio bytes + format metadata; the
+// daemon decodes via librarianasocketaudio, runs STT against the `talk` model,
+// then feeds the transcript into the same ask hop (and re-dispatch) as AskCmd.
+table TalkCmd {
+    audio:[ubyte];                      // raw audio bytes (encoding-tagged below)
+    encoding:string;                    // "pcm16" (raw LE int16) | "wav" (container)
+    sample_rate:uint32;                 // Hz (ignored when encoding == "wav")
+    channels:ubyte;                     // channel count
+}
+
+table LightCmd {
+    room:string;                        // optional; daemon default if absent
+    action:LightAction;                 // daemon validates value at dispatch
+}
+
+// ─── Union: the type-safe dispatch table ─────────────────────────
+union CommandPayload {
+    McServerCmd,
+    VolumeCmd,
+    PowerCmd,
+    PlayMovieCmd,
+    LaunchBrowserCmd,
+    MediaCmd,
+    LookupMachineCmd,
+    SpeakCmd,
+    LightCmd,
+    AskCmd,
+    TalkCmd
+}
+
+// ─── Top-level envelope ──────────────────────────────────────────
+table Command {
+    request_id:uint64;
+    payload:CommandPayload;             // exactly one variant, strongly typed
+}
+
+// ─── Response ────────────────────────────────────────────────────
+enum Status : byte {
+    OK = 0,
+    UNKNOWN_COMMAND = 1,
+    TYPE_MISMATCH = 2,                  // union variant doesn't match TOML expectation
+    EXECUTION_FAILED = 3,
+    INVALID_PAYLOAD = 4,
+    FORBIDDEN = 5,
+    SAFETY_GATE_FAILED = 6              // e.g. PowerCmd.confirm == false
+}
+
+table Response {
+    request_id:uint64;
+    status:Status;
+    message:string;
+}
+
+root_type Command;

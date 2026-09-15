@@ -1,0 +1,6 @@
+# Python build / cache artifacts for the rana-socket client package
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/

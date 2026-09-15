@@ -1,0 +1,4 @@
+type = process
+command = /usr/local/bin/rana-socketd /home/<user>/.config/rana/notebook.toml
+restart = true
+smooth-recovery = true

@@ -1,0 +1,15 @@
+# premake 
+build/
+Makefile
+*.make
+
+# build
+bin/
+obj/
+vendor/
+
+# flatbuffer
+schema/generated/
+
+# --- runtime artifacts ---
+*.sock
