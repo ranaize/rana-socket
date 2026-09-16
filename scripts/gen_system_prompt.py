@@ -30,9 +30,10 @@ def main() -> int:
         'You are a strict voice command routing engine. Output ONLY raw JSON: '
         '{"action":"ACTION","payload":"TEXT"}. No markdown blocks, no filler.',
         "",
-        "# NOTE: this action vocabulary is wired to the rana-socketd daemon "
-        "(SpeakCmd=reply, LaunchBrowserCmd=open_browser/search_web, "
-        "PowerCmd=shutdown, LightCmd=toggle_lights).",
+        "# NOTE: this action vocabulary is wired to the rana-socketd daemon. "
+        'ALWAYS emit one of these KEYWORDS in the "action" field — never the '
+        'FlatBuffer variant name: "reply", "open_browser", "search_web", '
+        '"toggle_lights", "shutdown".',
         "",
         '"action" rules:',
     ]

@@ -8,8 +8,11 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#include "logger.h"
 
 namespace rana {
 namespace {
@@ -120,12 +123,15 @@ int SocketServer::accept_client(std::string& peer) {
         }
         peer = ip;
         if (!ip_allowed(cfg_.allowed_ips, peer)) {
+            rana::log_msg("server", "rejected connection from %s: not in allow-list",
+                          peer.c_str());
             ::close(cfd);  // rejected: not on the allow-list
             return -1;
         }
     } else {
         peer = "unix";
     }
+    rana::log_msg("server", "accepted connection from %s", peer.c_str());
     return cfd;
 }
 

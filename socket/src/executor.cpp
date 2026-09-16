@@ -6,6 +6,7 @@
 
 #include "ask_reply_generated.h"
 #include "audio.hpp"
+#include "logger.h"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -24,6 +25,24 @@
 
 namespace rana {
 namespace {
+
+const char* payload_name(CommandPayload t) {
+    switch (t) {
+        case CommandPayload_McServerCmd:      return "McServerCmd";
+        case CommandPayload_VolumeCmd:        return "VolumeCmd";
+        case CommandPayload_PowerCmd:         return "PowerCmd";
+        case CommandPayload_PlayMovieCmd:     return "PlayMovieCmd";
+        case CommandPayload_LaunchBrowserCmd: return "LaunchBrowserCmd";
+        case CommandPayload_MediaCmd:         return "MediaCmd";
+        case CommandPayload_LookupMachineCmd: return "LookupMachineCmd";
+        case CommandPayload_SpeakCmd:         return "SpeakCmd";
+        case CommandPayload_LightCmd:         return "LightCmd";
+        case CommandPayload_AskCmd:           return "AskCmd";
+        case CommandPayload_TalkCmd:          return "TalkCmd";
+        case CommandPayload_NONE:             return "NONE";
+        default:                              return "?";
+    }
+}
 
 struct SpawnResult {
     int exit_code = -1;
@@ -261,8 +280,8 @@ RunOutcome Executor::run(const Command* cmd) {
         case CommandPayload_LookupMachineCmd: { RunOutcome o; o.result = run_lookup(cmd->payload_as<LookupMachineCmd>()); return o; }
         case CommandPayload_SpeakCmd:    { RunOutcome o; o.result = run_speak(cmd->payload_as<SpeakCmd>()); return o; }
         case CommandPayload_LightCmd:    { RunOutcome o; o.result = run_light(cmd->payload_as<LightCmd>()); return o; }
-        case CommandPayload_AskCmd:      { RunOutcome o; o.result = run_ask(cmd->payload_as<AskCmd>()).result; return o; }
-        case CommandPayload_TalkCmd:     { RunOutcome o; o.result = run_talk(cmd->payload_as<TalkCmd>()); return o; }
+        case CommandPayload_AskCmd:      return run_ask(cmd->payload_as<AskCmd>());
+        case CommandPayload_TalkCmd:     return run_talk(cmd->payload_as<TalkCmd>());
         case CommandPayload_NONE:        { RunOutcome o; o.result = {Status_INVALID_PAYLOAD, "empty payload"}; return o; }
         default:                         { RunOutcome o; o.result = {Status_UNKNOWN_COMMAND, "unsupported union variant"}; return o; }
     }
@@ -486,6 +505,7 @@ RunOutcome Executor::run_ask_text(const std::string& text) {
 
     const std::vector<std::string> env = {"RANA_CONFIG=" + cfg_.path};
     const std::vector<std::string> argv = {exe, text};
+    rana::log_msg("ask", "run_ask_text: question=%s", text.c_str());
     SpawnResult sr = spawn_process("", argv, env, entry->timeout_ms, /*capture_stdout=*/true);
     if (sr.spawn_failed) { RunOutcome o; o.result = {Status_EXECUTION_FAILED, "ask hop spawn failed"}; return o; }
     if (sr.timed_out)    { RunOutcome o; o.result = {Status_EXECUTION_FAILED, "ask hop timed out"}; return o; }
@@ -499,62 +519,68 @@ RunOutcome Executor::run_ask_text(const std::string& text) {
     if (!read_ask_reply(sr.stdout_text, action, payload)) {
         RunOutcome o; o.result = {Status_EXECUTION_FAILED, "ask hop returned an invalid AskReply buffer"}; return o;
     }
+    rana::log_msg("ask", "run_ask_text: LLM action=%s payload=%s", action.c_str(), payload.c_str());
     return dispatch_inner(action, payload);
 }
 
-Result Executor::run_talk(const TalkCmd* cmd) {
+RunOutcome Executor::run_talk(const TalkCmd* cmd) {
     // Capture → on-server STT → ask hop → re-dispatch. The untrusted client
     // sends only raw audio; decoding/transport is owned by rana-serializer.
-    if (cmd == nullptr) return {Status_INVALID_PAYLOAD, "bad payload"};
+    if (cmd == nullptr) return RunOutcome{false, {}, {Status_INVALID_PAYLOAD, "bad payload"}};
     const uint8_t* p = cmd->audio() ? cmd->audio()->data() : nullptr;
     const uint32_t n = cmd->audio() ? cmd->audio()->size() : 0;
-    if (p == nullptr || n == 0) return {Status_INVALID_PAYLOAD, "no audio"};
+    if (p == nullptr || n == 0) return RunOutcome{false, {}, {Status_INVALID_PAYLOAD, "no audio"}};
 
     const std::string encoding = cmd->encoding() ? cmd->encoding()->str() : std::string("pcm16");
     const uint32_t sample_rate = cmd->sample_rate();
     const uint8_t channels = cmd->channels();
+    rana::log_msg("talk", "run_talk: %u audio bytes, encoding=%s rate=%u ch=%u", n,
+                  encoding.c_str(), sample_rate, channels);
 
     std::string wav;
     if (!rana::serializer::audio::decode_to_wav(std::string(reinterpret_cast<const char*>(p), n), encoding,
                                     sample_rate, channels, wav)) {
-        return {Status_INVALID_PAYLOAD, "unsupported audio encoding: " + encoding};
+        return RunOutcome{false, {}, {Status_INVALID_PAYLOAD, "unsupported audio encoding: " + encoding}};
     }
 
     // Hand the decoded WAV to the STT backend via a temp file (the daemon has
     // no in-process HTTP client; it spawns a hop script, like the ask path).
     char tmpl[] = "/tmp/rana-talk-XXXXXX.wav";
     const int fd = ::mkstemps(tmpl, 4);
-    if (fd < 0) return {Status_EXECUTION_FAILED, "cannot create temp wav"};
+    if (fd < 0) return RunOutcome{false, {}, {Status_EXECUTION_FAILED, "cannot create temp wav"}};
     size_t off = 0;
     while (off < wav.size()) {
         const ssize_t w = ::write(fd, wav.data() + off, wav.size() - off);
-        if (w < 0) { ::close(fd); return {Status_EXECUTION_FAILED, "temp wav write failed"}; }
+        if (w < 0) { ::close(fd); return RunOutcome{false, {}, {Status_EXECUTION_FAILED, "temp wav write failed"}}; }
         off += static_cast<size_t>(w);
     }
     ::close(fd);
     const std::string wav_path(tmpl);
 
     const std::string stt_script = cfg_.stt.script;
-    if (stt_script.empty()) { ::unlink(wav_path.c_str()); return {Status_EXECUTION_FAILED, "stt not configured"}; }
+    if (stt_script.empty()) { ::unlink(wav_path.c_str()); return RunOutcome{false, {}, {Status_EXECUTION_FAILED, "stt not configured"}}; }
     const std::vector<std::string> env = {
         "STT_URL=" + cfg_.stt.url,
         "STT_MODEL=" + cfg_.stt.model,
     };
+    rana::log_msg("talk", "run_talk: running STT via %s (url=%s model=%s)", stt_script.c_str(),
+                  cfg_.stt.url.c_str(), cfg_.stt.model.c_str());
     SpawnResult sr = spawn_process("", {stt_script, wav_path}, env, cfg_.stt.timeout_ms,
                                   /*capture_stdout=*/true);
     ::unlink(wav_path.c_str());
-    if (sr.spawn_failed) return {Status_EXECUTION_FAILED, "stt spawn failed"};
-    if (sr.timed_out)    return {Status_EXECUTION_FAILED, "stt timed out"};
+    if (sr.spawn_failed) return RunOutcome{false, {}, {Status_EXECUTION_FAILED, "stt spawn failed"}};
+    if (sr.timed_out)    return RunOutcome{false, {}, {Status_EXECUTION_FAILED, "stt timed out"}};
     if (sr.exit_code != 0) {
         std::string msg = "stt exit " + std::to_string(sr.exit_code);
         if (!sr.stderr_text.empty()) msg += ": " + sr.stderr_text;
-        return {Status_EXECUTION_FAILED, msg};
+        return RunOutcome{false, {}, {Status_EXECUTION_FAILED, msg}};
     }
 
     std::string transcript = sr.stdout_text;
     while (!transcript.empty() && std::isspace(static_cast<unsigned char>(transcript.back())))
         transcript.pop_back();
-    return run_ask_text(transcript).result;
+    rana::log_msg("talk", "run_talk: transcript=%s", transcript.c_str());
+    return run_ask_text(transcript);
 }
 
 // Re-dispatch the LLM-routed action internally. The reply text from the hop is
@@ -562,48 +588,62 @@ Result Executor::run_talk(const TalkCmd* cmd) {
 // the SAME executor path (and SAME config gate) handles it. No LLM output ever
 // leaves the daemon.
 RunOutcome Executor::dispatch_inner(const std::string& action, const std::string& payload) {
+    // The LLM may emit either the prompted keyword ("open_browser") or the
+    // FlatBuffer variant name ("LaunchBrowserCmd"); normalize to the keyword the
+    // router below expects so a model that echoes the variant name still routes.
+    std::string a = action;
+    if (a == "LaunchBrowserCmd" || a == "browser") a = "open_browser";
+    else if (a == "SpeakCmd")                       a = "reply";
+    else if (a == "PowerCmd")                       a = "shutdown";
+    else if (a == "LightCmd")                       a = "toggle_lights";
+
     flatbuffers::FlatBufferBuilder b(256);
     CommandPayload type = CommandPayload_NONE;
     flatbuffers::Offset<void> up;
     // [commands.<key>] used to test whether THIS daemon owns the command.
     std::string cfg_key;
-    const char* variant = nullptr;
 
-    if (action == "reply") {
+    if (a == "reply") {
         up = CreateSpeakCmd(b, b.CreateString(payload)).Union();
         type = CommandPayload_SpeakCmd;
-        cfg_key = "speak"; variant = "SpeakCmd";
-    } else if (action == "open_browser") {
+        cfg_key = "speak";
+    } else if (a == "open_browser") {
         up = CreateLaunchBrowserCmd(b, b.CreateString(payload)).Union();
         type = CommandPayload_LaunchBrowserCmd;
-        cfg_key = "browser"; variant = "LaunchBrowserCmd";
-    } else if (action == "search_web") {
+        cfg_key = "browser";
+    } else if (a == "search_web") {
         std::string q = payload;
         for (char& c : q) if (c == ' ') c = '+';
         up = CreateLaunchBrowserCmd(b, b.CreateString("https://duckduckgo.com/?q=" + q)).Union();
         type = CommandPayload_LaunchBrowserCmd;
-        cfg_key = "browser"; variant = "LaunchBrowserCmd";
-    } else if (action == "toggle_lights") {
+        cfg_key = "browser";
+    } else if (a == "toggle_lights") {
         up = CreateLightCmd(b, b.CreateString(payload), LightAction_Toggle).Union();
         type = CommandPayload_LightCmd;
-        cfg_key = "lights"; variant = "LightCmd";
-    } else if (action == "shutdown") {
+        cfg_key = "lights";
+    } else if (a == "shutdown") {
         up = CreatePowerCmd(b, PowerAction_Shutdown, /*confirm=*/true).Union();
         type = CommandPayload_PowerCmd;
-        cfg_key = "power"; variant = "PowerCmd";
+        cfg_key = "power";
     } else {
         RunOutcome o; o.result = {Status_UNKNOWN_COMMAND, "ask returned unknown action: " + action};
         return o;
     }
 
-    const auto cmd_off = CreateCommand(b, /*request_id=*/0, type, up);
-    b.Finish(cmd_off);
+    // Serialize the chosen Command so it can be forwarded to the client or run
+    // locally through the normal dispatch path.
+    const auto cmd = CreateCommand(b, 0, type, up);
+    FinishCommandBuffer(b, cmd);
     std::vector<uint8_t> inner(b.GetBufferPointer(), b.GetBufferPointer() + b.GetSize());
 
-    // Run locally only if this daemon has the command mapped; otherwise forward
-    // the typed Command back to the client (socket 1) for execution there.
+    // Variant name is derived from the command key (matches the toml->schema
+    // mapping in config.cpp) so it is never hardcoded in two places.
+    std::string variant = derive_variant(cfg_key);
     Result fail;
     const CommandEntry* entry = lookup(cfg_key, variant, fail);
+    rana::log_msg("dispatch", "action=%s cfg_key=%s variant=%s -> %s", a.c_str(),
+                  cfg_key.c_str(), variant.c_str(),
+                  entry ? "execute-locally" : "forward-to-client");
     if (entry == nullptr) {
         RunOutcome fwd;
         fwd.forward_to_client = true;
@@ -626,16 +666,28 @@ void handle_connection(int fd, Executor& exec) {
         if (VerifyCommandBuffer(v)) {
             const Command* cmd = GetCommand(frame.data());
             request_id = cmd->request_id();
+            rana::log_msg("conn", "recv request_id=%llu payload_type=%s(%d)",
+                          static_cast<unsigned long long>(request_id),
+                          payload_name(cmd->payload_type()),
+                          static_cast<int>(cmd->payload_type()));
             outcome = exec.run(cmd);
         } else {
+            rana::log_msg("conn", "recv malformed flatbuffer (%zu bytes)", frame.size());
             outcome.result = {Status_INVALID_PAYLOAD, "malformed flatbuffer"};
         }
 
         std::vector<uint8_t> resp;
         if (outcome.forward_to_client) {
             resp = exec.build_forward_response(request_id, outcome.forward_cmd);
+            rana::log_msg("conn", "send request_id=%llu forward_to_client (status=%d, %zu bytes)",
+                          static_cast<unsigned long long>(request_id),
+                          static_cast<int>(outcome.result.status), resp.size());
         } else {
             resp = exec.build_response(request_id, outcome.result);
+            rana::log_msg("conn", "send request_id=%llu status=%d msg=%s (%zu bytes)",
+                          static_cast<unsigned long long>(request_id),
+                          static_cast<int>(outcome.result.status),
+                          outcome.result.message.c_str(), resp.size());
         }
         if (!write_frame(fd, resp.data(), static_cast<uint32_t>(resp.size()))) break;
     }

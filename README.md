@@ -94,7 +94,7 @@ bin/Release/rana-socket-client <addr> ask "what time is it"
 
 `ask` sends an `AskCmd{text}` to the daemon. The daemon is the **only** caller of
 LocalAI: it runs `scripts/rana-ask.sh` (override the endpoint with `ASK_LLM_URL`,
-default `http://localai:8080`), which queries the tower's `command` model and pipes
+default `http://localai:8080`), which queries the server's `command` model and pipes
 the JSON through `rana-serializer`. That translator emits a binary `rana::AskReply`
 FlatBuffer (schema in `schema/ask_reply.fbs`); **the daemon never parses JSON** — it
 verifies and reads the buffer, then re-dispatches internally (`reply`→`SpeakCmd`,

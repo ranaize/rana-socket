@@ -225,7 +225,7 @@ scripts/
 - No `debug` library — cannot introspect/modify the VM state
 - No `loadstring` with dynamic content — `PLUTO_DISABLE_COMPILED` prevents bytecode loading
 - Process spawning delegated to the daemon's `spawn_process` (fork/execvpe with PATH sanitization) — scripts never touch `fork`/`exec` directly
-- Network egress is **allowlisted, not blocked**: the `rana.http_*` primitives in `luafunctions.cpp` validate the destination against the endpoint table set in `init.lua` (`rana.allow_endpoints`) before any connection is made. Default: only the tower's LocalAI (`http://localai:8080`). No `socket`/`http` stdlib modules are exposed directly to scripts — all network goes through the C bridge.
+- Network egress is **allowlisted, not blocked**: the `rana.http_*` primitives in `luafunctions.cpp` validate the destination against the endpoint table set in `init.lua` (`rana.allow_endpoints`) before any connection is made. Default: only the server's LocalAI (`http://localai:8080`). No `socket`/`http` stdlib modules are exposed directly to scripts — all network goes through the C bridge.
 
 ### 5. `init.lua` — System Interface Registry
 
@@ -258,7 +258,7 @@ rana.allow_binaries({
 })
 
 -- Whitelisted network endpoints (checked in luafunctions.cpp before any
--- rana.http_* call leaves the daemon): the tower's own LocalAI.
+-- rana.http_* call leaves the daemon): the server's own LocalAI.
 rana.allow_endpoints({
     { scheme = "http", host = "localai", port = 8080 },
 })

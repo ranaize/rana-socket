@@ -4,3 +4,4 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+rana_socket/command_generated.py

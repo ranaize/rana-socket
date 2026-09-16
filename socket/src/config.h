@@ -7,6 +7,13 @@
 
 namespace rana {
 
+// Derive the FlatBuffers union table name for a [commands.<key>] section:
+// CamelCase(key) + "Cmd" (e.g. "volume" -> "VolumeCmd", "mc_server" ->
+// "McServerCmd"), with a few overrides for tables that diverge. This is the
+// single source of truth shared by config parsing and the dispatch router, so
+// the variant name is never hardcoded twice.
+std::string derive_variant(const std::string& key);
+
 struct DaemonConfig {
     std::string socket_type = "unix";    // "unix" | "tcp"
     std::string socket_path;             // UDS path
@@ -17,7 +24,7 @@ struct DaemonConfig {
 };
 
 struct CommandEntry {
-    std::string variant;      // FlatBuffers table name, e.g. "VolumeCmd"
+    std::string variant;      // FlatBuffers table name, derived from the [commands.<key>] name (e.g. "browser" -> "LaunchBrowserCmd")
     std::string type;         // script | exec | docker_compose | system
     std::string path;         // script path
     std::string binary;

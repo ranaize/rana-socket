@@ -1,16 +1,18 @@
 [daemon]
 socket_type = "unix"
-# Shared with the rana-voice-agent container over the `rana_sock` volume
-# (mounted at /run/rana in both). The daemon runs as uid 1000 (same as the
-# agent) so the 0o600 socket is connectable by the agent.
-socket_path = "/run/rana/rana-local.sock"
+# The daemon runs NATIVELY on the host (see rana-deploy/Makefile). It creates the
+# socket under run/rana/ (relative to the rana-deploy dir), which is bind-mounted
+# into the agent container at /run/rana so the agent can forward to it. The daemon
+# drops to uid 1000 (same as the agent) so the 0o600 socket is connectable.
+socket_path = "run/rana/rana-local.sock"
 socket_permissions = 0o600
 
-# Each command maps a union variant name to an executor.
-# The union variant name MUST match the FlatBuffers table name.
+# Each [commands.<key>] maps a command to an executor. The FlatBuffers union
+# table is derived from the key (CamelCase + "Cmd", e.g. "volume" -> "VolumeCmd",
+# "mc_server" -> "McServerCmd"); "browser" is the one exception -> "LaunchBrowserCmd".
+# You never specify 'variant' in the toml.
 
 [commands.volume]
-variant = "VolumeCmd"
 type = "script"
 path = "/usr/local/bin/rana-volume.sh"
 # Params are injected as env vars from the strongly-typed fields:
@@ -18,26 +20,22 @@ path = "/usr/local/bin/rana-volume.sh"
 timeout_ms = 2000
 
 [commands.media]
-variant = "MediaCmd"
 type = "script"
 path = "/usr/local/bin/rana-media.sh"
 # ACTION, TARGET
 timeout_ms = 2000
 
 [commands.browser]
-variant = "LaunchBrowserCmd"
 type = "exec"
 binary = "/usr/bin/xdg-open"
 default_url = "https://duckduckgo.com"
 
 [commands.speak]
-variant = "SpeakCmd"
 type = "exec"
 binary = "/usr/bin/espeak-ng"
 timeout_ms = 5000
 
 [commands.lights]
-variant = "LightCmd"
 type = "script"
 path = "/usr/local/bin/rana-lights.sh"
 # ACTION, ROOM

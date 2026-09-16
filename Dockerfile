@@ -73,6 +73,10 @@ COPY --from=builder /src/scripts/rana-ask.sh /usr/local/bin/rana-ask.sh
 COPY --from=builder /src/scripts/rana-stt.sh /usr/local/bin/rana-stt.sh
 COPY --from=builder /src/scripts/gen_system_prompt.py /usr/local/bin/gen_system_prompt.py
 COPY --from=builder /src/serializer/bin/Release/rana-serializer /usr/local/bin/rana-serializer
+# The daemon build regenerates command_generated.py from command.fbs via flatc;
+# export it so the agent's Python client stays in lockstep with the daemon's
+# compiled C++ schema (same union ordinals / status codes) and never drifts.
+COPY --from=builder /src/schema/generated/command_generated.py /opt/rana/client_command_generated.py
 RUN chmod 0755 /usr/local/bin/rana-socketd /usr/local/bin/rana-ask.sh \
     /usr/local/bin/rana-stt.sh /usr/local/bin/gen_system_prompt.py \
     /usr/local/bin/rana-serializer

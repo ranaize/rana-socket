@@ -52,7 +52,7 @@ private:
     Result run_speak(const SpeakCmd* cmd);
     Result run_light(const LightCmd* cmd);
     RunOutcome run_ask(const AskCmd* cmd);
-    Result run_talk(const TalkCmd* cmd);
+    RunOutcome run_talk(const TalkCmd* cmd);
 
     // Shared LLM-hop path: run the ask script with `text` and re-dispatch the
     // routed action. Used by both AskCmd (text already in hand) and TalkCmd

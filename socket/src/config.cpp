@@ -1,5 +1,7 @@
 #include "config.h"
 
+#include <cctype>
+#include <map>
 #include <set>
 
 #include <toml.hpp>
@@ -13,7 +15,7 @@ const std::set<std::string> kDaemonKeys = {
 };
 
 std::set<std::string> allowed_command_keys(const std::string& type) {
-    std::set<std::string> keys = {"variant", "type", "timeout_ms"};
+    std::set<std::string> keys = {"type", "timeout_ms"};
     if (type == "script") {
         keys.insert("path");
         keys.insert("default_subnet");
@@ -46,6 +48,27 @@ std::string unknown_key(const toml::table& table, const std::set<std::string>& a
 }
 
 }  // namespace
+
+// The FlatBuffers union table for a command is conventionally the config key in
+// CamelCase + "Cmd" (e.g. "volume" -> "VolumeCmd", "mc_server" -> "McServerCmd").
+// A few tables diverge from that naming; listed in kOverride so the toml never
+// needs a 'variant' attribute repeating the schema name.
+std::string derive_variant(const std::string& key) {
+    static const std::map<std::string, std::string> kOverride = {
+        {"browser", "LaunchBrowserCmd"},
+    };
+    auto it = kOverride.find(key);
+    if (it != kOverride.end()) return it->second;
+
+    std::string out;
+    bool cap = true;
+    for (char c : key) {
+        if (c == '_') { cap = true; continue; }
+        out += cap ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c;
+        cap = false;
+    }
+    return out + "Cmd";
+}
 
 bool Config::load(const std::string& path, Config& out, std::string& err) {
     try {
@@ -88,13 +111,8 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
                     return false;
                 }
                 const std::string type = t->at_path("type").value_or(std::string());
-                const std::string variant = t->at_path("variant").value_or(std::string());
                 if (type.empty()) {
                     err = "[commands." + key + "]: missing 'type'";
-                    return false;
-                }
-                if (variant.empty()) {
-                    err = "[commands." + key + "]: missing 'variant'";
                     return false;
                 }
                 if (const std::string e = unknown_key(*t, allowed_command_keys(type), "[commands." + key + "]");
@@ -104,7 +122,7 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
                 }
 
                 CommandEntry entry;
-                entry.variant = variant;
+                entry.variant = derive_variant(key);
                 entry.type = type;
                 entry.path = t->at_path("path").value_or(std::string());
                 entry.binary = t->at_path("binary").value_or(std::string());

@@ -10,12 +10,16 @@ package and is produced by:
 """
 
 import base64
+import logging
 import socket
 import struct
+import time
 
 import flatbuffers
 
 from . import command_generated as fb
+
+logger = logging.getLogger(__name__)
 
 
 _MC_ACTIONS = {
@@ -202,12 +206,24 @@ def send(sock: socket.socket, payload: bytes) -> dict:
     (7) means the daemon could not run the command locally and has base64-
     encoded the inner Command in the message for the caller to relay elsewhere.
     """
-    sock.sendall(struct.pack(">I", len(payload)) + payload)
-    length = struct.unpack(">I", _recv_exact(sock, 4))[0]
-    resp_bytes = _recv_exact(sock, length)
+    logger.debug("send: transmitting %d-byte framed command", len(payload))
+    t0 = time.monotonic()
+    try:
+        sock.sendall(struct.pack(">I", len(payload)) + payload)
+        length = struct.unpack(">I", _recv_exact(sock, 4))[0]
+        resp_bytes = _recv_exact(sock, length)
+    except (OSError, ConnectionError) as e:
+        logger.error("send: transport error after %.2fs: %s", time.monotonic() - t0, e)
+        raise
     r = fb.Response.GetRootAsResponse(resp_bytes, 0)
     status = r.Status()
+    dt = time.monotonic() - t0
     if status == fb.Status.FORWARD_TO_CLIENT:
+        logger.info(
+            "recv: %d-byte response in %.2fs — status=FORWARD_TO_CLIENT (server "
+            "defers to local daemon), inner command %d bytes",
+            length, dt, len(r.Message() or b""),
+        )
         return {
             "request_id": r.RequestId(),
             "status": status,
@@ -215,10 +231,16 @@ def send(sock: socket.socket, payload: bytes) -> dict:
             "forward": True,
             "command": base64.b64decode(r.Message()),
         }
+    msg = (r.Message() or b"").decode(errors="replace")
+    logger.info(
+        "recv: %d-byte response in %.2fs — status=%s(%d)%s",
+        length, dt, STATUS_NAMES.get(status, str(status)), status,
+        f" message={msg!r}" if msg else "",
+    )
     return {
         "request_id": r.RequestId(),
         "status": status,
         "status_name": STATUS_NAMES.get(status, str(status)),
-        "message": (r.Message() or b"").decode(),
+        "message": msg,
         "forward": False,
     }
