@@ -1,8 +1,12 @@
 #include "config.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <map>
 #include <set>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <toml.hpp>
 
@@ -11,34 +15,19 @@ namespace {
 
 const std::set<std::string> kDaemonKeys = {
     "socket_type", "socket_path", "socket_permissions",
-    "bind_address", "port", "allowed_ips",
+    "bind_address", "port", "allowed_ips", "scripts_dir",
 };
 
-std::set<std::string> allowed_command_keys(const std::string& type) {
-    std::set<std::string> keys = {"type", "timeout_ms", "description", "keywords", "danger", "forward_only"};
-    if (type == "script") {
-        keys.insert("path");
-        keys.insert("default_subnet");
-    } else if (type == "exec") {
-        keys.insert("binary");
-        keys.insert("default_url");
-    } else if (type == "docker_compose") {
-        keys.insert("workdir");
-        keys.insert("default_world");
-    } else if (type == "system") {
-        keys.insert("binary");
-        keys.insert("suspend_binary");
-        keys.insert("requires_confirm");
-    }
-    return keys;
+std::set<std::string> allowed_llm_keys() {
+    return {"url", "model"};
 }
 
 std::set<std::string> allowed_stt_keys() {
-    return {"script", "url", "model", "timeout_ms"};
+    return {"url", "model", "timeout_ms"};
 }
 
 std::string unknown_key(const toml::table& table, const std::set<std::string>& allowed,
-                       const std::string& context) {
+                        const std::string& context) {
     for (const auto& [key, value] : table) {
         if (allowed.count(std::string(key)) == 0) {
             return context + ": unknown key '" + std::string(key) + "'";
@@ -47,37 +36,92 @@ std::string unknown_key(const toml::table& table, const std::set<std::string>& a
     return {};
 }
 
+// Directory of the running daemon binary (Linux: /proc/self/exe).
+std::string exe_dir() {
+    char buf[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        const std::string p(buf, static_cast<size_t>(n));
+        const auto pos = p.find_last_of('/');
+        return (pos == std::string::npos) ? std::string(".") : p.substr(0, pos);
+    }
+    return ".";
+}
+
+bool has_init_lua(const std::string& dir) {
+    if (dir.empty()) return false;
+    struct stat st {};
+    return ::stat((dir + "/init.lua").c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+std::string dirname_of(const std::string& path) {
+    const auto pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) return ".";
+    if (pos == 0) return "/";
+    return path.substr(0, pos);
+}
+
+// Walk up from `start` (a directory) looking for a `scripts/` dir with init.lua.
+std::string find_scripts_upwards(const std::string& start) {
+    std::string dir = start;
+    for (;;) {
+        const std::string cand = dir + "/scripts";
+        if (has_init_lua(cand)) return cand;
+        const std::string parent = dirname_of(dir);
+        if (parent == dir) break;  // reached filesystem root
+        dir = parent;
+    }
+    return {};
+}
+
 }  // namespace
 
-// The FlatBuffers union table for a command is conventionally the config key in
-// CamelCase + "Cmd" (e.g. "volume" -> "VolumeCmd", "mc_server" -> "McServerCmd").
-// A few tables diverge from that naming; listed in kOverride so the toml never
-// needs a 'variant' attribute repeating the schema name.
-std::string derive_variant(const std::string& key) {
-    static const std::map<std::string, std::string> kOverride = {
-        {"browser", "LaunchBrowserCmd"},
-    };
-    auto it = kOverride.find(key);
-    if (it != kOverride.end()) return it->second;
-
-    std::string out;
-    bool cap = true;
-    for (char c : key) {
-        if (c == '_') { cap = true; continue; }
-        out += cap ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c;
-        cap = false;
+std::string resolve_scripts_dir(const Config& cfg) {
+    // 1) Explicit env override (host launch / Makefile sets RANA_SCRIPTS_DIR).
+    if (const char* e = ::getenv("RANA_SCRIPTS_DIR")) {
+        if (std::string s(e); !s.empty()) return s;
     }
-    return out + "Cmd";
+    // 2) Config value (empty => fall through to autodiscover).
+    std::string cfg_dir = cfg.daemon.scripts_dir;
+    if (!cfg_dir.empty()) {
+        if (cfg_dir[0] != '/') cfg_dir = cfg.workdir + "/" + cfg_dir;
+        return cfg_dir;
+    }
+    // 3) Autodiscover: walk up from the binary, then fixed install locations.
+    if (auto f = find_scripts_upwards(exe_dir()); !f.empty()) return f;
+    if (has_init_lua("/opt/rana/scripts")) return "/opt/rana/scripts";
+    if (has_init_lua(cfg.workdir + "/scripts")) return cfg.workdir + "/scripts";
+    // Nothing found — return a best-guess path so the error names what we wanted.
+    return cfg.workdir + "/scripts";
+}
+
+std::string normalize_key(const std::string& key) {
+    std::string out;
+    for (char c : key) {
+        if (std::isspace(static_cast<unsigned char>(c))) continue;
+        out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
 }
 
 bool Config::load(const std::string& path, Config& out, std::string& err) {
     try {
         out.path = path;
+
+        // workdir defaults to the config file's directory so scripts/ resolves
+        // relative to wherever the daemon's config lives.
+        {
+            std::string p = path;
+            const auto slash = p.find_last_of("/\\");
+            out.workdir = (slash == std::string::npos) ? std::string(".") : p.substr(0, slash);
+            if (out.workdir.empty()) out.workdir = ".";
+        }
+
         const toml::parse_result tbl = toml::parse_file(path);
 
         for (const auto& [key, value] : tbl) {
             const std::string k(key);
-            if (k != "daemon" && k != "commands" && k != "stt") {
+            if (k != "daemon" && k != "llm" && k != "stt" && k != "commands") {
                 err = "unknown top-level key '" + k + "'";
                 return false;
             }
@@ -95,6 +139,7 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
             }
             if (auto v = daemon->at_path("bind_address").value<std::string>()) out.daemon.bind_address = *v;
             if (auto v = daemon->at_path("port").value<int64_t>()) out.daemon.port = static_cast<uint16_t>(*v);
+            if (auto v = daemon->at_path("scripts_dir").value<std::string>()) out.daemon.scripts_dir = *v;
             if (const auto* arr = daemon->at_path("allowed_ips").as_array()) {
                 for (const auto& el : *arr) {
                     if (auto s = el.value<std::string>()) out.daemon.allowed_ips.push_back(*s);
@@ -102,48 +147,13 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
             }
         }
 
-        if (const auto* commands = tbl["commands"].as_table()) {
-            for (const auto& [name, node] : *commands) {
-                const auto* t = node.as_table();
-                const std::string key(name);
-                if (t == nullptr) {
-                    err = "[commands." + key + "]: not a table";
-                    return false;
-                }
-                const std::string type = t->at_path("type").value_or(std::string());
-                if (type.empty()) {
-                    err = "[commands." + key + "]: missing 'type'";
-                    return false;
-                }
-                if (const std::string e = unknown_key(*t, allowed_command_keys(type), "[commands." + key + "]");
-                    !e.empty()) {
-                    err = e;
-                    return false;
-                }
-
-                CommandEntry entry;
-                entry.variant = derive_variant(key);
-                entry.type = type;
-                entry.path = t->at_path("path").value_or(std::string());
-                entry.binary = t->at_path("binary").value_or(std::string());
-                entry.workdir = t->at_path("workdir").value_or(std::string());
-                entry.default_world = t->at_path("default_world").value_or(std::string());
-                entry.default_url = t->at_path("default_url").value_or(std::string());
-                entry.default_subnet = t->at_path("default_subnet").value_or(std::string());
-                entry.suspend_binary = t->at_path("suspend_binary").value_or(std::string());
-                entry.requires_confirm = t->at_path("requires_confirm").value_or(false);
-                entry.timeout_ms =
-                    static_cast<uint32_t>(t->at_path("timeout_ms").value_or(int64_t{5000}));
-                entry.description = t->at_path("description").value_or(std::string());
-                entry.danger = t->at_path("danger").value_or(false);
-                entry.forward_only = t->at_path("forward_only").value_or(false);
-                if (const auto* arr = t->at_path("keywords").as_array()) {
-                    for (const auto& el : *arr) {
-                        if (auto s = el.value<std::string>()) entry.keywords.push_back(*s);
-                    }
-                }
-                out.commands.emplace(key, std::move(entry));
+        if (const auto* llm = tbl["llm"].as_table()) {
+            if (const std::string e = unknown_key(*llm, allowed_llm_keys(), "[llm]"); !e.empty()) {
+                err = e;
+                return false;
             }
+            if (auto v = llm->at_path("url").value<std::string>()) out.llm.url = *v;
+            if (auto v = llm->at_path("model").value<std::string>()) out.llm.model = *v;
         }
 
         if (const auto* stt = tbl["stt"].as_table()) {
@@ -151,11 +161,31 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
                 err = e;
                 return false;
             }
-            out.stt.script    = stt->at_path("script").value_or(std::string());
-            out.stt.url       = stt->at_path("url").value_or(std::string("http://localai:8080"));
-            out.stt.model     = stt->at_path("model").value_or(std::string("talk"));
-            out.stt.timeout_ms =
-                static_cast<uint32_t>(stt->at_path("timeout_ms").value_or(int64_t{30000}));
+            if (auto v = stt->at_path("url").value<std::string>()) out.stt.url = *v;
+            if (auto v = stt->at_path("model").value<std::string>()) out.stt.model = *v;
+            if (auto v = stt->at_path("timeout_ms").value<int64_t>()) {
+                out.stt.timeout_ms = static_cast<uint32_t>(*v);
+            }
+        }
+
+        // [commands] now holds only [commands.allowed] — a set of enabled script
+        // keys. Any other [commands.*] table is rejected; per-command tuning lives
+        // in the script's own meta table.
+        if (const auto* commands = tbl["commands"].as_table()) {
+            if (const auto* allowed = commands->at_path("allowed").as_table()) {
+                for (const auto& [name, value] : *allowed) {
+                    const std::string key(name);
+                    const bool enabled = value.value_or(false);
+                    if (enabled) out.allowed.insert(normalize_key(key));
+                }
+            } else if (commands->contains("allowed")) {
+                err = "[commands.allowed] must be a table of key = bool";
+                return false;
+            } else if (!commands->empty()) {
+                err = "[commands] may only contain [commands.allowed]; "
+                      "per-command tables (variant/type/path) are no longer supported";
+                return false;
+            }
         }
 
         return true;

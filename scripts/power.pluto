@@ -1,0 +1,67 @@
+-- scripts/power.pluto
+-- key = "power". Host power management via the fixed-argv sudo entries
+-- (shutdown/reboot/suspend in init.lua).
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Power",
+    description = "Host power management (shutdown/reboot/suspend).",
+    actions = { "shutdown", "reboot", "suspend" },
+    keywords = {
+        "shutdown", "shut down", "power off", "power down", "reboot",
+        "restart the computer", "suspend", "sleep",
+    },
+    -- Danger: matched ONLY on an exact phrase ("shutdown", "power off", ...) so
+    -- a partial sentence like "shutdown the minecraft server" can never land
+    -- here (it routes to mc_server instead).
+    danger = true,
+    params = {},
+    timeout_ms = 5000,
+    examples = {
+        { action = "suspend" },
+        { action = "reboot" },
+    },
+}
+
+-- When routed without a verb (fuzzy/LLM emit the KEY, not the action), infer it
+-- from the spoken words, e.g. "shut down", "restart", "go to sleep".
+function M.execute(cmd)
+    local action = cmd.action
+    if not action or action == "" then
+        -- Fold runs of spaces/hyphens into a single space so "shut down",
+        -- "shut-down" and "shutdown" all read as "shut down". Mirrors the
+        -- danger keywords that can route here.
+        local t = (cmd.target or ""):lower():gsub("[%s%-]+", " ")
+        if t:match("shut[%w%s]-down") or t:match("power[%w%s]-down")
+           or t:match("shutdown") or t:match("power[%w%s]-off") then
+            action = "shutdown"
+        elseif t:match("reboot") or t:match("restart") then
+            action = "reboot"
+        elseif t:match("suspend") or t:match("sleep") then
+            action = "suspend"
+        else
+            -- Never guess-and-suspend: an unrecognized power request fails closed.
+            return { status = "error", message = "unrecognized power request" }
+        end
+    end
+    if action ~= "shutdown" and action ~= "reboot" and action ~= "suspend" then
+        return { status = "error", message = "unknown power action: " .. tostring(action) }
+    end
+
+    -- Fixed argv-backed verbs (init.lua entries shutdown/reboot/suspend run sudo -n
+    -- with hardcoded arguments); we only pick the entry name, never args.
+    local result = rana.spawn(action)
+    if result.timed_out then
+        return { status = "error", message = "command timed out" }
+    end
+    if result.exit_code ~= 0 then
+        return { status = "error", message = "power failed: " .. result.stderr }
+    end
+
+    return { status = "ok", message = "power " .. action }
+end
+
+return M

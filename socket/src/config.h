@@ -2,17 +2,26 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 namespace rana {
 
-// Derive the FlatBuffers union table name for a [commands.<key>] section:
-// CamelCase(key) + "Cmd" (e.g. "volume" -> "VolumeCmd", "mc_server" ->
-// "McServerCmd"), with a few overrides for tables that diverge. This is the
-// single source of truth shared by config parsing and the dispatch router, so
-// the variant name is never hardcoded twice.
-std::string derive_variant(const std::string& key);
+// Derive the canonical script key for a [commands.allowed] entry. The return
+// value is just the trimmed key name; kept for any legacy callers. The new
+// registry is a flat set of enabled script keys — no variant/type/path.
+std::string normalize_key(const std::string& key);
+
+struct Config;  // forward declaration; full definition below
+
+// Resolve the directory holding init.lua + the *.pluto scripts. Resolution order:
+//   1. $RANA_SCRIPTS_DIR            explicit override (set by `make server`/`make client`)
+//   2. daemon.scripts_dir from config (absolute, or relative to the config's dir)
+//   3. autodiscover: walk up from the daemon binary's directory, then fixed
+//      locations such as /opt/rana/scripts (the canonical install path).
+// When scripts_dir is omitted from the config, autodiscovery is used by default.
+std::string resolve_scripts_dir(const Config& cfg);
 
 struct DaemonConfig {
     std::string socket_type = "unix";    // "unix" | "tcp"
@@ -21,45 +30,27 @@ struct DaemonConfig {
     std::string bind_address = "127.0.0.1";
     uint16_t port = 0;
     std::vector<std::string> allowed_ips;  // exact IPs or CIDR ranges
+    std::string scripts_dir;               // optional; empty => autodiscover (see resolve_scripts_dir)
 };
 
-struct CommandEntry {
-    std::string variant;      // FlatBuffers table name, derived from the [commands.<key>] name (e.g. "browser" -> "LaunchBrowserCmd")
-    std::string type;         // script | exec | docker_compose | system
-    std::string path;         // script path
-    std::string binary;
-    std::string workdir;
-    std::string default_world;
-    std::string default_url;
-    std::string default_subnet;
-    std::string suspend_binary;
-    bool requires_confirm = false;
-    uint32_t timeout_ms = 5000;
-    // Fuzzy pre-router metadata (used to route a spoken query to this command
-    // before falling back to the LLM). `danger` commands require an EXACT phrase
-    // match (no partial) so a phrase like "shutdown the minecraft server" can
-    // never collapse onto a machine-power command.
-    std::string description;
-    std::vector<std::string> keywords;
-    bool danger = false;
-    // A command the daemon may route/forward but never execute locally (e.g. a
-    // device command owned by the peer). The fuzzy pre-router can still match it
-    // and dispatch_inner forwards it instead of trying to run it here.
-    bool forward_only = false;
+struct LlmConfig {
+    std::string url = "http://localai:8080";  // LocalAI chat endpoint base
+    std::string model = "command";            // command-routing model name
 };
 
 struct SttConfig {
-    std::string script;                       // STT hop script (spawned by the daemon)
-    std::string url = "http://localai:8080";  // LocalAI transcription endpoint
+    std::string url = "http://localai:8080";  // LocalAI transcription endpoint base
     std::string model = "talk";               // whisper model name (talk.yaml)
     uint32_t timeout_ms = 30000;
 };
 
 struct Config {
     DaemonConfig daemon;
+    LlmConfig llm;
     SttConfig stt;
-    std::map<std::string, CommandEntry> commands;
-    std::string path;   // path this config was loaded from (passed to hops)
+    std::set<std::string> allowed;  // [commands.allowed]: enabled script keys
+    std::string path;               // path this config was loaded from
+    std::string workdir;            // daemon working directory (scripts resolved here)
 
     // Strict loader: rejects malformed files and unknown keys at startup.
     static bool load(const std::string& path, Config& out, std::string& err);

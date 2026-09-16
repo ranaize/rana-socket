@@ -1,0 +1,44 @@
+-- scripts/browser.pluto
+-- key = "browser". Opens a URL in the default browser via xdg-open.
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Browser",
+    description = "Open a URL in the default web browser.",
+    actions = { "open" },
+    keywords = {
+        "browser", "web browser", "open the browser", "open a page",
+        "open a website", "open a web page",
+    },
+    params = { url = "the URL to open" },
+    timeout_ms = 5000,
+    examples = {
+        { action = "open", target = "https://example.com" },
+    },
+}
+
+-- No URL in the spoken words ("open browser") -> open the default start page.
+local DEFAULT_URL = "https://www.google.com"
+
+function M.execute(cmd)
+    if cmd.action ~= "open" then
+        return { status = "error", message = "unknown browser action: " .. tostring(cmd.action) }
+    end
+    local url = cmd.target or ""
+    if url == "" then url = DEFAULT_URL end
+
+    local result = rana.spawn("xdg_open", url)
+    if result.timed_out then
+        return { status = "error", message = "command timed out" }
+    end
+    if result.exit_code ~= 0 then
+        return { status = "error", message = "xdg-open failed: " .. result.stderr }
+    end
+
+    return { status = "ok", message = "opened " .. url }
+end
+
+return M

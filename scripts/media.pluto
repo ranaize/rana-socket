@@ -1,0 +1,51 @@
+-- scripts/media.pluto
+-- key = "media". Media player control via the deployment's `media` backend.
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Media",
+    description = "Control the media player (play/pause/next/prev/stop).",
+    actions = { "play", "pause", "next", "prev", "stop", "volume" },
+    keywords = { "media", "music", "player", "play music", "pause the music" },
+    params = { arg = "optional argument (e.g. volume level)" },
+    timeout_ms = 5000,
+    examples = {
+        { action = "pause" },
+        { action = "play" },
+    },
+}
+
+-- Routed with a bare KEY? The verb is in the words ("pause the music",
+-- "play the next song").
+function M.execute(cmd)
+    local action = cmd.action
+    local target = cmd.target or ""
+    if not action or action == "" then
+        local t = (target or ""):lower()
+        if t:match("pause") then action = "pause"
+        elseif t:match("stop") then action = "stop"
+        elseif t:match("next") then action = "next"
+        elseif t:match("previous") or t:match("prev") then action = "prev"
+        else action = "play" end
+        target = ""
+    end
+    local args = { action }
+    if target ~= "" then
+        table.insert(args, target)
+    end
+
+    local result = rana.spawn("media", table.unpack(args))
+    if result.timed_out then
+        return { status = "error", message = "command timed out" }
+    end
+    if result.exit_code ~= 0 then
+        return { status = "error", message = "media failed: " .. result.stderr }
+    end
+
+    return { status = "ok", message = "media " .. action }
+end
+
+return M

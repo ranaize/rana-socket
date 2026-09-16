@@ -1,0 +1,66 @@
+-- scripts/talk.pluto
+-- Voice ingress. `talk` is a script like any other: raw audio rides in cmd.data,
+-- params describe the raw codec (encoding/sample_rate/channels), and this file
+-- owns the decode -> stt -> ask chain that used to be hardcoded in
+-- executor.cpp::run_talk. The STT and LLM hops are reached through the generic
+-- rana.dispatch hop (not hardcoded bindings): stt transcribes the WAV, ask routes
+-- the resulting intent (see scripts/ask.pluto — reply -> rana.respond("speak"),
+-- intents the server owns run locally, device intents are responded to the
+-- client daemon). Edit or replace this file to change the voice pipeline.
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Talk",
+    description = "Transcribe spoken audio and execute the resulting request.",
+    actions = { "talk" },
+    params = {
+        encoding = "pcm16 or wav",
+        sample_rate = "pcm sample rate (default 16000)",
+        channels = "pcm channels (default 1)",
+    },
+    timeout_ms = 30000,
+    examples = { { action = "talk" } },
+    -- talk's Lua state stays alive across both blocking hops (stt + ask), so it
+    -- needs the same extra idle grant its upstreams declare.
+    flags = { rana.flags.LONG_IDLE },
+}
+
+function M.execute(cmd)
+    local audio = cmd.data or ""
+    if #audio == 0 then
+        return { status = "invalid_payload", message = "no audio" }
+    end
+
+    local encoding = "pcm16"
+    local sample_rate = 16000
+    local channels = 1
+    if cmd.params then
+        if cmd.params.encoding ~= nil then encoding = tostring(cmd.params.encoding) end
+        if cmd.params.sample_rate ~= nil then sample_rate = tonumber(cmd.params.sample_rate) or 16000 end
+        if cmd.params.channels ~= nil then channels = tonumber(cmd.params.channels) or 1 end
+    end
+
+    -- Decode the raw payload to WAV; the codec lives in C++ (rana.audio module).
+    local wav = rana.audio.decode_to_wav(audio, encoding, sample_rate, channels)
+    if not wav or #wav == 0 then
+        return { status = "invalid_payload", message = "unsupported audio encoding: " .. encoding }
+    end
+
+    -- STT hop (scripts/stt.pluto): the WAV rides in the args table's `target`
+    -- slot (binary-safe); internal marks a PIPELINE hop (stt is not in
+    -- [commands.allowed]). Returns {status, message} with the transcript in `message`.
+    local t = rana.dispatch("stt", "stt", { target = wav, internal = true })
+    if type(t) ~= "table" or t.status ~= "ok" or not t.message or t.message == "" then
+        return { status = "execution_failed", message = "stt returned nothing" }
+    end
+
+    -- Ask hop (scripts/ask.pluto): it owns the reply/intent routing, so the
+    -- result of `ask` IS the result of `talk` (reply -> speak is responded to
+    -- the client at talk's outermost dispatch; local intents run on the server).
+    return rana.dispatch("ask", "ask", { target = t.message, internal = true })
+end
+
+return M

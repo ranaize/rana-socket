@@ -8,18 +8,43 @@ sha256 = "6b5172ad4dd6519aec67b919181fa7a38a2234131e5b2afa232dfe444819783e"
 dest = "root://vendor/"
 create_directory = true
 
+# Pluto — embeddable Lua 5.5 fork. predep clones it and builds it with its own
+# Makefile into a shared library (libpluto.so) via the "pluto" make stage below.
+# Pinned to the 0.13.1 release commit for reproducibility. The daemon then links
+# the prebuilt .so instead of compiling Pluto's ~160 sources in-tree.
+[[vendor]]
+name = "pluto"
+repo = "https://github.com/PlutoLang/Pluto.git"
+ref  = "e00dfe6a155262c3e4bf6b4b13c221f83b5cc050"
+dest = "root://vendor/pluto"
+builder = "pluto"
+
 [[stages]]
 name = "vendor"
 type = "vendor"
 
+# Build Pluto as a shared library. The hardening flags are baked into the
+# compiled runtime (see docs/security.md) and must match the runtime mask in
+# luafunctions.cpp::new_state(). Soup is built as part of this target.
+# PLUTO_ETL_ENABLE arms Pluto's per-state execution-time budget, but the daemon
+# OVERRIDES the deadline per script in new_state(): each state's budget is its
+# script's meta.timeout_ms (5s when none) instead of the compile-time
+# PLUTO_ETL_NANOS default, so no huge compile constant is needed here.
+[[stages]]
+name = "pluto"
+type = "make"
+source = "root://vendor/pluto/src"
+targets = ["libpluto.so"]
+jobs = 0
+variables = { MYCFLAGS = "-DPLUTO_DISABLE_COMPILED -DPLUTO_NO_BINARIES -DPLUTO_DISABLE_HTTP_COMPLETELY -DPLUTO_ETL_ENABLE -DPLUTO_ILP_ENABLE", SYSLIBS = "-ldl -lresolv" }
+
 [[stages]]
 name = "build"
 type = "premake5"
-depends = ["vendor"]
+depends = ["vendor", "pluto"]
 clean = true
 outputs = [
   "root://socket/bin/Release/rana-socketd",
-  "root://serializer/bin/Release/rana-serializer",
 ]
 
 [[stages]]
@@ -29,9 +54,6 @@ targets = ["build"]
 paths = [
   "root://socket/bin",
   "root://socket/obj",
-  "root://serializer/bin",
-  "root://serializer/obj",
-  "root://serializer/lib",
   "root://client/cpp/bin",
   "root://client/cpp/obj",
 ]
@@ -47,4 +69,5 @@ chmod = 755
 chown_user = true
 artifacts = [
   { source = "root://socket/bin/Release/rana-socketd", dest = "rana-socketd" },
+  { source = "root://vendor/pluto/src/libpluto.so", dest = "libpluto.so" },
 ]

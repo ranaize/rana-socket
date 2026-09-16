@@ -92,14 +92,14 @@ bin/Release/rana-socket-client <addr> speak "text"
 bin/Release/rana-socket-client <addr> ask "what time is it"
 ```
 
-`ask` sends an `AskCmd{text}` to the daemon. The daemon is the **only** caller of
-LocalAI: it runs `scripts/rana-ask.sh` (override the endpoint with `ASK_LLM_URL`,
-default `http://localai:8080`), which queries the server's `command` model and pipes
-the JSON through `rana-serializer`. That translator emits a binary `rana::AskReply`
-FlatBuffer (schema in `schema/ask_reply.fbs`); **the daemon never parses JSON** — it
-verifies and reads the buffer, then re-dispatches internally (`reply`→`SpeakCmd`,
-`search_web`/`open_browser`→`LaunchBrowserCmd`, `toggle_lights`→`LightCmd`,
-`shutdown`→`PowerCmd`). The routed executor's status/message becomes the reply.
+`ask` sends a `Command{key="ask", action="ask", target=text}` to the daemon. The
+daemon is the **only** caller of LocalAI: `init.lua` registers the LLM endpoint, and
+`scripts/ask.pluto` queries it via `rana.http_post`, then builds the `rana::AskReply`
+FlatBuffer in-process with `rana.build_ask_reply` (schema in `schema/ask_reply.fbs`).
+**The daemon never parses JSON in C++** — it verifies and reads the buffer, then
+re-dispatches internally (`reply`→`speak`, `open_browser`→`browser`,
+`toggle_lights`→`lights`, `shutdown`→`power`). The routed script's status/message
+becomes the reply.
 
 To enable it, the daemon config needs a `[commands.ask]` entry pointing at the hop
 script, e.g.:

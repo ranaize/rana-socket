@@ -1,0 +1,63 @@
+-- scripts/lights.pluto
+-- key = "lights". Smart-home light control via the deployment's `lights` backend.
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Lights",
+    description = "Control smart lights (on/off/toggle/color).",
+    actions = { "on", "off", "toggle", "color" },
+    keywords = {
+        "lights", "light", "turn on the lights", "turn off the lights",
+        "set the lights", "turn the lights on", "turn the lights off",
+    },
+    params = {
+        room  = "room/zone identifier (target)",
+        color = "hex color when action=color",
+    },
+    timeout_ms = 5000,
+    examples = {
+        { action = "on",  target = "living_room" },
+        { action = "off", target = "bedroom" },
+    },
+}
+
+-- Routed with a bare KEY ("turn off the lights")? The verb is in the words, not
+-- in cmd.action; room is unknown so it defaults to "all" (backend-wide toggle).
+function M.execute(cmd)
+    local action = cmd.action
+    local room = cmd.target or ""
+    if not action or action == "" then
+        local t = (room or ""):lower()
+        if t:match("turn%-?off") or t:match("off the lights") or t:match("%f[%a]off%f[^%a]") then
+            action = "off"
+        elseif t:match("turn%-?on") or t:match("%f[%a]on%f[^%a]") or t:match("^on ") then
+            action = "on"
+        elseif t:match("color") then
+            action = "color"
+        else
+            action = "toggle"
+        end
+        room = ""   -- room was the spoken phrase, not a zone id
+    end
+    if room == "" then room = "all" end
+
+    local args = { action, room }
+    if action == "color" then
+        table.insert(args, cmd.params and cmd.params.color or "")
+    end
+
+    local result = rana.spawn("lights", table.unpack(args))
+    if result.timed_out then
+        return { status = "error", message = "command timed out" }
+    end
+    if result.exit_code ~= 0 then
+        return { status = "error", message = "lights failed: " .. result.stderr }
+    end
+
+    return { status = "ok", message = "lights " .. action .. " " .. room }
+end
+
+return M

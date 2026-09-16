@@ -1,88 +1,47 @@
 # rana-deploy rana-socket config — host daemon (canonical default).
 # Run NATIVELY on the host by `make server` (rana-deploy/Makefile): the daemon
 # binds TCP :9000 on the host and reaches LocalAI via the host-published 8080.
-# Command set is a superset of the bare-metal notebook config: it keeps the
-# host-tied commands (mc_server/power/play_movie/lookup_machine) AND adds the
-# re-dispatch targets (speak/lights/browser) the ask hop routes into. The
-# host-tied commands need host-available equivalents; speak/lights/browser need
-# their executors present on the host (espeak-ng, rana-lights.sh, xdg-open).
+#
+# Scriptable command model (the design is in the socket/scripts + socket/src
+# sources; see scripts/ask.pluto and scripts/talk.pluto for the hop piping):
+#   - [commands.allowed] is the registry. A key is addressable ONLY if it is
+#     listed here AND a matching scripts/<key>.pluto exists (cross-checked by the
+#     daemon at startup).
+#   - `ask` and `talk` are scripts like any other (scripts/ask.pluto,
+#     scripts/talk.pluto → scripts/stt.pluto); ask/talk/run_stt are in-process
+#     Pluto hops, not shell scripts. The daemon owns all LocalAI/STT calls.
+#   - Each script self-describes (meta) and the actual executables it may reach
+#     are whitelisted in scripts/init.lua, not here.
 
 [daemon]
 socket_type = "tcp"
 bind_address = "0.0.0.0"
 port = 9000
+# scripts_dir is optional: when omitted the daemon autodiscovers it (walks up from
+# its own binary, then /opt/rana/scripts). Override via the RANA_SCRIPTS_DIR env var.
 # Peers allowed to connect to the TCP door. The daemon closes (on accept) any
 # peer not listed here — a rejected client shows up as a "Broken pipe" on its
 # first send. 127.0.0.1 plus typical LAN subnets cover the notebook agent
 # (via host.docker.internal) reaching the host's :9000. Tighten to your network.
 allowed_ips = ["127.0.0.1", "172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"]
 
-[commands.mc_server]
-type = "docker_compose"
-workdir = "/opt/minecraft"
-default_world = "survival"
-description = "start, stop, or restart the Minecraft game server"
-keywords = ["minecraft", "mc server", "minecraft server"]
+# The command registry. Order does not matter.
+[commands.allowed]
+"ask"             = true
+"talk"            = true
+"power"           = true
+"mc_server"       = true
+"lookup_machine"  = true
 
-# Danger command: only an EXACT phrase match (e.g. "shutdown", "power off",
-# "turn off") routes here. A partial phrase like "shutdown the minecraft server"
-# must NOT collapse onto machine power — it must fall through to mc_server.
-[commands.power]
-type = "system"
-binary = "/usr/bin/dinitctl"
-suspend_binary = "/usr/bin/zzz"
-requires_confirm = true
-description = "shut down or reboot this machine"
-keywords = ["shutdown", "power off", "turn off"]
-danger = true
+# The daemon is the ONLY LocalAI caller. The ask hop (scripts/ask.pluto) reads
+# these to build its request. `make server` injects the real URL via environment.
+[llm]
+url = "http://127.0.0.1:8080/v1/chat/completions"
+model = "command"
 
-# Forward-only mirrors of the client's device commands. The server runs STT, so
-# its fuzzy pre-router needs these described here to match them and forward the
-# resulting Command to the client (which actually owns the executors). They are
-# never executed on the server (forward_only = true).
-[commands.browser]
-type = "exec"
-binary = "/usr/bin/xdg-open"
-default_url = "https://duckduckgo.com"
-description = "open the default web browser"
-keywords = ["browser", "open browser"]
-forward_only = true
-
-[commands.lights]
-type = "script"
-path = "rana-lights.sh"
-description = "toggle the smart lights"
-keywords = ["lights", "light", "lamp"]
-forward_only = true
-
-[commands.volume]
-type = "script"
-path = "rana-volume.sh"
-description = "set the speaker volume or mute the sound"
-keywords = ["volume", "sound", "mute"]
-forward_only = true
-
-[commands.media]
-type = "script"
-path = "rana-media.sh"
-description = "play, pause, or stop media on a player"
-keywords = ["media", "play", "pause", "kodi", "mpv"]
-forward_only = true
-
-# The daemon is the ONLY LocalAI caller. AskCmd.text rides here to the ask hop
-# script over the socket en route to LocalAI. The hop reads ASK_LLM_URL from the
-# environment (injected by `make server`); default below matches that.
-[commands.ask]
-type = "script"
-path = "rana-ask.sh"
-# TEXT passed via argv, never a shell.
-timeout_ms = 30000
-
-# On-server STT for TalkCmd. The daemon decodes the audio (libranasocketaudio)
-# to a WAV and hands it to this hop; the transcript is routed through the ask hop.
-# The daemon runs on the host, so LocalAI is reached via the host-published 8080.
+# On-server STT for TalkCmd. The daemon decodes the audio to a WAV and hands it to
+# scripts/stt.pluto, which POSTs it to this endpoint and returns the transcript.
 [stt]
-script = "rana-stt.sh"
-url = "http://127.0.0.1:8080"
+url = "http://127.0.0.1:8080/v1/audio/transcriptions"
 model = "talk"
 timeout_ms = 30000

@@ -1,0 +1,38 @@
+-- scripts/play_movie.pluto
+-- key = "play_movie". Stream a movie to the TV via the deployment's `movie` backend.
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Play Movie",
+    description = "Play a movie/stream on the TV.",
+    actions = { "play", "stop" },
+    keywords = { "movie", "film", "movie on", "play movie", "netflix", "stream" },
+    params = { url = "media URL or title (target)" },
+    timeout_ms = 15000,
+    examples = {
+        { action = "play", target = "http://media.local/movie.mkv" },
+    },
+}
+
+function M.execute(cmd)
+    local action = cmd.action or "play"
+    local what = cmd.target or ""
+    if what == "" then
+        return { status = "error", message = "missing url/title" }
+    end
+
+    local result = rana.spawn("movie", action, what)
+    if result.timed_out then
+        return { status = "error", message = "command timed out" }
+    end
+    if result.exit_code ~= 0 then
+        return { status = "error", message = "movie failed: " .. result.stderr }
+    end
+
+    return { status = "ok", message = action .. " " .. what }
+end
+
+return M

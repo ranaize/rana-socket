@@ -1,0 +1,273 @@
+-- scripts/ask.pluto
+-- In-process LLM hop. Replaces scripts/rana-ask.sh. Like every command, `ask` is
+-- dispatched to M.execute here; the LLM call lives in M.ask, which talk.pluto
+-- reaches as a pipeline hop via rana.dispatch("ask", "ask", { target = transcript, internal = true }).
+-- M.ask returns {action, payload} and M.execute routes the intent:
+--   * a FUZZY match   -> the transcript is matched against every script's meta
+--                         (description + keywords + danger) BEFORE the LLM is
+--                         touched, so "open browser" goes straight to the client.
+--                         The LLM remains the fallback for everything else.
+--   * "reply"         -> rana.respond("speak", payload): the answer is TTS'd by
+--                         the PEER (client) daemon.
+--   * a known [commands.allowed] -> rana.dispatch locally (power/mc_server/...).
+--   * known but NOT allowed here -> owned by the peer; rana.respond relays it
+--                         with the mapped default action (open/toggle/play/...).
+--   * unknown         -> error, never forwarded.
+-- FLAG_LONG_IDLE grants extra wall-clock on top of timeout_ms (the LLM call is a
+-- slow, blocking upstream that would otherwise eat the whole Lua budget).
+-- No subprocess, no shell, no curl on the host.
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Ask",
+    description = "Answer a text question and route the intent to a script.",
+    actions = { "ask" },
+    timeout_ms = 30000,
+    examples = { { action = "ask", target = "turn on the living room lights" } },
+    flags = { rana.flags.LONG_IDLE },
+}
+
+-- ─── Fuzzy pre-router (ported from the old executor.cpp pre-router) ─────────
+-- Routing happens lexically first, then the LLM. Function words that carry no
+-- routing intent ("the", "and", "or", "put", "turn", ...) appear in nearly every
+-- description, so including them in the overlap score produces false matches
+-- against unrelated queries. Stripping them is what keeps "open browser" and
+-- "please open the browser" from collapsing every command together.
+local STOPWORDS = {}
+for w in ([[the a an of to on in for with and or is are be am my your our
+their please can could would should will you i it this that these those what
+who how why when where do does did have has some any into from at by as so if
+then about me we they he she turn set make get got close just now]]):gmatch("%a+") do
+    STOPWORDS[w] = true
+end
+
+local SKIP = { ask = true, speak = true, talk = true, stt = true }
+
+local function tokenize(s)
+    local out = {}
+    for w in (s or ""):lower():gmatch("%a+") do out[#out + 1] = w end
+    return out
+end
+
+local function drop_stopwords(s)
+    local out = {}
+    for _, w in ipairs(tokenize(s)) do
+        if not STOPWORDS[w] then out[#out + 1] = w end
+    end
+    return out
+end
+
+-- Meaningful-token phrase, single-spaced (exact-match form).
+local function norm_meaningful(s)
+    return table.concat(drop_stopwords(s), " ")
+end
+
+local function overlap_count(haystack, needles)
+    local h = {}
+    for _, w in ipairs(haystack) do h[w] = true end
+    local n = 0
+    for _, w in ipairs(needles) do if h[w] then n = n + 1 end end
+    return n
+end
+
+-- Best-matching script KEY for a transcript, or nil. `danger` scripts (power)
+-- only match on an EXACT keyword phrase, so "shutdown the minecraft server" can
+-- never collapse onto a machine-power command.
+local function fuzzy_best_command(text)
+    local qt = drop_stopwords(text)
+    if #qt == 0 then return nil end
+    local qnorm = norm_meaningful(text)
+
+    -- Danger commands: exact phrase only.
+    for key, m in pairs(rana.script_metas() or {}) do
+        if not SKIP[key] and m.danger then
+            for _, kw in ipairs(m.keywords or {}) do
+                if norm_meaningful(kw) == qnorm then return key end
+            end
+        end
+    end
+
+    -- Everything else: best meaningful-token overlap with description+keywords.
+    -- Need at least one overlapping token, and roughly half the query's
+    -- meaningful tokens, so a single common word can't false-route.
+    local need = #qt <= 2 and 1 or math.floor((#qt + 1) / 2)
+    local best, best_score
+    for key, m in pairs(rana.script_metas() or {}) do
+        if not SKIP[key] and not m.danger then
+            local corpus = drop_stopwords(m.description or "")
+            for _, kw in ipairs(m.keywords or {}) do
+                for e, tok in ipairs(drop_stopwords(kw)) do corpus[#corpus + 1] = tok end
+            end
+            if #corpus > 0 then
+                local ov = overlap_count(corpus, qt)
+                if ov >= need and ov > (best_score or 0) then
+                    best, best_score = key, ov
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function extract_url(text)
+    local url = string.match(text, "https?://[%w%.%-%_~/:%?%%&=+#@]+")
+    if url then return url end
+    return string.match(text, "www%.[%w%.%-]+")
+end
+
+-- Fuzzy hit → {action, payload} with the script-specific operand extracted from
+-- the spoken words. Multi-verb scripts (power/mc_server/media/lights/volume) get
+-- the raw text and infer the verb themselves; the single-verb ones need the URL
+-- / name / title pulled out.
+local function fuzzy_route(text)
+    local key = fuzzy_best_command(text)
+    if not key then return nil end
+    rana.log("fuzzy", "transcript '" .. text .. "' routed to " .. key .. " (no LLM)")
+    local payload
+    if key == "browser" then
+        payload = extract_url(text) or ""
+    elseif key == "play_movie" then
+        payload = extract_url(text) or text
+    elseif key == "lookup_machine" then
+        payload = text
+    else
+        payload = text
+    end
+    return { action = key, payload = payload }
+end
+
+-- ─── LLM answer extraction ──────────────────────────────────────────────────
+
+-- Keep the LAST well-formed JSON object in the reply. Weak models echo the
+-- prompt or repeat their answer; the routing object is flat, so scan every
+-- non-greedy {..} fragment and keep the last one that decodes.
+local function extract_json(text)
+    if not text then return nil end
+    local best, i0 = nil, 1
+    while true do
+        local s, e = string.find(text, "{.-}", i0)
+        if not s then break end
+        local j, _ = rana.json_decode(string.sub(text, s, e))
+        if j then best = j end
+        i0 = e + 1
+    end
+    return best
+end
+
+-- Accept both schemas the model may drift across: {command, text} and
+-- {action, payload/target}. The fallback NEVER reads the model's rambling back
+-- to the user (that is how the JSON/garbage got spoken): long or chatty output
+-- (echoed routing prose) collapses to a short generic reply.
+local function parse_action(content)
+    local j = extract_json(content)
+    if j then
+        local cmd = j.command or j.action
+        local payload = j.text or j.payload or j.target
+        if cmd and payload and payload ~= "" then
+            return tostring(cmd), tostring(payload)
+        end
+    end
+    local t = content or ""
+    while true do
+        local s, e = string.find(t, "{.-}")
+        if not s then break end
+        t = t:sub(1, s - 1) .. t:sub(e + 1)
+    end
+    t = t:gsub("%(%w+%)", "")                 -- drop "(question)"-style labels
+    t = t:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if #t > 200 or t:find("action is", 1, true) or t:find("with target", 1, true) then
+        return "reply", "I did not understand that."
+    end
+    if t == "" then t = "I did not catch that." end
+    return "reply", t
+end
+
+function M.ask(text)
+    -- Fuzzy pre-route: skip the LLM pass entirely for a confident lexical match.
+    local routed = fuzzy_route(text)
+    if routed then return routed end
+
+    local url = rana.get_llm_url()
+    if url == "" then
+        return { action = "reply", payload = "LLM endpoint is not configured." }
+    end
+
+    local ok, body = rana.http_post(url, {
+        model = rana.get_llm_model(),
+        messages = {
+            { role = "system", content = rana.get_system_prompt() },
+            { role = "user",   content = text },
+        },
+        temperature = 0.2,
+        max_tokens = 256,
+    })
+
+    if not ok then
+        return { action = "reply", payload = "Sorry, I could not reach the language model." }
+    end
+
+    local j = rana.json_decode(body)
+    local content = j and j.choices and j.choices[1] and j.choices[1].message
+                   and j.choices[1].message.content or ""
+    if content == "" then
+        content = j and j.text or ""
+    end
+
+    local action, payload = parse_action(content)
+    return { action = action, payload = payload }
+end
+
+-- Default inner action for a routed script KEY. The LLM/fuzzy emits the KEY;
+-- the script's execute() checks its verb (open/toggle/play/...). Scripts not
+-- listed (power, mc_server, lights, media, volume) infer their verb from the
+-- payload text instead.
+local DEFAULT_ACTION = {
+    browser = "open",
+    speak = "speak",
+    play_movie = "play",
+    lookup_machine = "lookup",
+}
+
+-- Route an {action, payload} ask result. Shared tail for ask.pluto's and
+-- talk.pluto's execute entries. rana.dispatch uses edge semantics: only commands
+-- allowed on THIS daemon run locally; a forbidden-but-known action is relayed to
+-- the peer with rana.respond; an unknown action is an error.
+local function route(result)
+    if result and result.status ~= nil then
+        return result
+    end
+    if not result or not result.action or result.action == "" then
+        return { status = "execution_failed", message = "ask returned nothing" }
+    end
+    local action, payload = result.action, tostring(result.payload or "")
+    if action == "reply" then
+        if payload == "" then payload = "I do not have an answer for that." end
+        return rana.respond("speak", "speak", { target = payload })
+    end
+    if not rana.has_script(action) then
+        return { status = "forbidden", message = "unknown action: " .. action }
+    end
+    local inner = DEFAULT_ACTION[action] or ""
+    local r = rana.dispatch(action, inner, { target = payload })
+    if r and r.status == "forbidden" then
+        -- Known script, but this daemon is not allowed to run it -> peer's job.
+        return rana.respond(action, inner, { target = payload })
+    end
+    return r
+end
+
+-- Daemon-level entry: the `ask` command. `ask` does NOT hop into itself (that
+-- would recurse into M.execute); it calls M.ask directly, then routes the intent.
+function M.execute(cmd)
+    local question = cmd.target
+    if question == "" then question = cmd.data or "" end
+    if question == "" then
+        return { status = "invalid_payload", message = "no question" }
+    end
+    return route(M.ask(question))
+end
+
+return M

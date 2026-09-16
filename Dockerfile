@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 #
-# rana-socketd image (Task 1).
-# Multi-stage: build the statically-linked daemon + flatc from flatbuffers
-# v24.3.25 (same pin as predep.toml), then ship a slim runtime that also
-# carries scripts/rana-ask.sh (the LLM hop).
+# rana-socketd image.
+# Multi-stage: build the daemon (dynamically linked to the prebuilt libpluto.so)
+# v25.12.19 (flatc pin below must match the host toolchain's flatc — the Python
+# runtime API surface is locked to the generator version), then ship a slim
+# runtime that also carries the self-describing .pluto scripts.
 
 ############################ builder ############################
 # trixie (glibc 2.41 / GLIBCXX_3.4.32) is required: the `predep` release binary
@@ -30,13 +31,14 @@ RUN curl -fsSL "https://github.com/10per5/predep/releases/latest/download/predep
     && rm -rf /tmp/pd /tmp/predep.tgz \
     && predep --version
 
-# flatc (flatbuffers compiler) v24.3.25 — same pin as predep.toml; consumed by
-# the premake gen_schema_client prebuild to generate the FlatBuffers headers.
+# flatc (flatbuffers compiler) v25.12.19 — must match the host toolchain's flatc
+# (and the python client's pinned flatbuffers==25.12.19); consumed by the premake
+# gen_schema_client prebuild to generate the FlatBuffers headers.
 # Also install the matching flatbuffers runtime headers to /usr/local/include so
-# the daemon/client/serializer compiles find "flatbuffers/flatbuffers.h" without
+# the daemon/client compiles find "flatbuffers/flatbuffers.h" without
 # depending on a system flatbuffers package or predep's (often-empty) vendored
 # copy. Using the same source as flatc keeps the version exact.
-ARG FLATBUFFERS_VER=24.3.25
+ARG FLATBUFFERS_VER=25.12.19
 RUN curl -fsSL "https://github.com/google/flatbuffers/archive/refs/tags/v${FLATBUFFERS_VER}.tar.gz" -o /tmp/fb.tgz \
     && mkdir -p /tmp/fb && tar -xzf /tmp/fb.tgz -C /tmp/fb \
     && cmake -S "/tmp/fb/flatbuffers-${FLATBUFFERS_VER}" -B /tmp/fb/build \
@@ -46,6 +48,13 @@ RUN curl -fsSL "https://github.com/google/flatbuffers/archive/refs/tags/v${FLATB
     && mkdir -p /usr/local/include/flatbuffers \
     && cp -r "/tmp/fb/flatbuffers-${FLATBUFFERS_VER}/include/flatbuffers/." /usr/local/include/flatbuffers/ \
     && rm -rf /tmp/fb /tmp/fb.tgz
+
+# Pluto — embeddable Lua 5.5 fork used by the script runtime. Vendored by predep
+# (git clone pinned in predep.toml) into vendor/pluto, then built by predep's
+# "pluto" make stage into vendor/pluto/src/libpluto.so. rana-socketd links that
+# prebuilt shared lib; the runtime stage below ships libpluto.so next to the
+# binary (matched by the $ORIGIN rpath). Security toggles are passed via the
+# make stage's MYCFLAGS in predep.toml.
 
 WORKDIR /src
 COPY . .
@@ -64,22 +73,24 @@ RUN predep
 
 ############################ runtime ############################
 FROM debian:bookworm-20260824-slim AS runtime
+# espeak-ng is the only host binary the default scripts spawn (see scripts/init.lua).
+# Everything else (ask/stt) runs in-process via Pluto; the other script backends
+# (lights/media/power/...) are deployment-specific and expected on the host.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates jq espeak-ng python3 \
+    curl ca-certificates espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/socket/bin/Release/rana-socketd /usr/local/bin/rana-socketd
-COPY --from=builder /src/scripts/rana-ask.sh /usr/local/bin/rana-ask.sh
-COPY --from=builder /src/scripts/rana-stt.sh /usr/local/bin/rana-stt.sh
-COPY --from=builder /src/scripts/gen_system_prompt.py /usr/local/bin/gen_system_prompt.py
-COPY --from=builder /src/serializer/bin/Release/rana-serializer /usr/local/bin/rana-serializer
+# Pluto shared lib — must sit beside the binary so the $ORIGIN rpath resolves it.
+COPY --from=builder /src/vendor/pluto/src/libpluto.so /usr/local/bin/libpluto.so
+# Self-describing scripts + the system-interface registry. No shell hops, no python.
+COPY --from=builder /src/scripts/init.lua /opt/rana/scripts/init.lua
+COPY --from=builder /src/scripts/*.pluto /opt/rana/scripts/
 # The daemon build regenerates command_generated.py from command.fbs via flatc;
 # export it so the agent's Python client stays in lockstep with the daemon's
-# compiled C++ schema (same union ordinals / status codes) and never drifts.
+# compiled C++ schema (same status codes) and never drifts.
 COPY --from=builder /src/schema/generated/command_generated.py /opt/rana/client_command_generated.py
-RUN chmod 0755 /usr/local/bin/rana-socketd /usr/local/bin/rana-ask.sh \
-    /usr/local/bin/rana-stt.sh /usr/local/bin/gen_system_prompt.py \
-    /usr/local/bin/rana-serializer
+RUN chmod 0755 /usr/local/bin/rana-socketd
 
 # HEALTHCHECK dials port 9000 with a zero-length frame.
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

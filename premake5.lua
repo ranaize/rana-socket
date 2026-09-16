@@ -18,8 +18,7 @@ workspace "rana-socketd"
 -- ROOT is the directory of this premake5.lua (the repo root). Every
 -- subproject premake file references it so all projects emit their build
 -- artifacts and generated *.make files at the root, exactly where the
--- top-level Makefile expects them (rana-socketd.make, rana-socket-client.make,
--- rana-serializer.make, rana-serializer-cli.make).
+-- top-level Makefile expects them (rana-socketd.make, rana-socket-client.make).
 ROOT = path.getdirectory(_SCRIPT)
 
 schema_file     = ROOT .. "/schema/command.fbs"
@@ -50,4 +49,3 @@ end
 -- ── subproject build definitions ───────────────────────────────────
 include(ROOT .. "/socket/premake5.lua")
 include(ROOT .. "/client/cpp/premake5.lua")
-include(ROOT .. "/serializer/premake5.lua")

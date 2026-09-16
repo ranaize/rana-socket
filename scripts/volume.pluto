@@ -1,0 +1,68 @@
+-- scripts/volume.pluto
+-- key = "volume". Verifies the client request against rana.LuaRuntime's allowed
+-- metadata (enforced in C), then shells out to `espeak` to "speak" the result
+-- (placeholder for a real volume backend; geometry unchanged).
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Volume Control",
+    description = "Set or query the system volume.",
+    actions = { "set", "get", "up", "down" },
+    keywords = { "volume", "set the volume", "mute", "volume up", "volume down" },
+    params = {
+        level = "0-100 when action=set",
+        step  = "percent step for up/down (default 5)",
+    },
+    timeout_ms = 5000,
+    examples = {
+        { action = "set", target = "50" },
+        { action = "get" },
+    },
+}
+
+-- Routed with a bare KEY? Infer the verb and operand from the words
+-- ("turn the volume up", "mute", "set it to 50").
+function M.execute(cmd)
+    local action = cmd.action
+    local arg = cmd.target or ""
+    if not action or action == "" then
+        local t = (arg or ""):lower()
+        local lvl = string.match(t, "%d+")
+        if t:match("mute") or t:match("muted") then
+            action, arg = "set", "0"
+        elseif lvl then
+            action, arg = "set", lvl
+        elseif t:match("up") or t:match("louder") or t:match("raise") then
+            action = "up"
+        elseif t:match("down") or t:match("quieter") or t:match("lower") then
+            action = "down"
+        else
+            action = "get"
+        end
+    end
+    if action ~= "set" and action ~= "get" and action ~= "up" and action ~= "down" then
+        return { status = "error", message = "unknown volume action: " .. tostring(action) }
+    end
+
+    if action == "set" then
+        arg = tostring(arg or "")
+    else
+        arg = action
+    end
+
+    -- rana.spawn returns { spawn_failed, timed_out, exit_code, stdout, stderr }.
+    local result = rana.spawn("espeak", "volume " .. arg)
+    if result.timed_out then
+        return { status = "error", message = "command timed out" }
+    end
+    if result.exit_code ~= 0 then
+        return { status = "error", message = "espeak failed: " .. result.stderr }
+    end
+
+    return { status = "ok", message = (result.stdout or ""):gsub("%s+$", "") }
+end
+
+return M

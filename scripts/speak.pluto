@@ -1,0 +1,37 @@
+-- scripts/speak.pluto
+-- key = "speak". The text-to-speech sink used by the ask hop's "reply" action,
+-- and directly addressable as a command.
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Speak",
+    description = "Speak text aloud via espeak-ng.",
+    actions = { "speak" },
+    params = { text = "the text to speak" },
+    timeout_ms = 10000,
+    examples = {
+        { action = "speak", target = "Hello world" },
+    },
+}
+
+function M.execute(cmd)
+    local text = cmd.target or ""
+    if text == "" then
+        return { status = "error", message = "nothing to speak" }
+    end
+
+    local result = rana.spawn("espeak", text)
+    if result.timed_out then
+        return { status = "error", message = "command timed out" }
+    end
+    if result.exit_code ~= 0 then
+        return { status = "error", message = "espeak failed: " .. result.stderr }
+    end
+
+    return { status = "ok", message = "spoke: " .. text }
+end
+
+return M

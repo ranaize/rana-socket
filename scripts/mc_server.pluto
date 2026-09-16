@@ -1,0 +1,49 @@
+-- scripts/mc_server.pluto
+-- key = "mc_server". Manage a Minecraft server container via docker.
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Minecraft Server",
+    description = "Start/stop/restart/status a Minecraft server container.",
+    actions = { "start", "stop", "restart", "status" },
+    keywords = { "minecraft", "mc server", "minecraft server" },
+    params = {},
+    timeout_ms = 15000,
+    examples = {
+        { action = "start" },
+        { action = "status" },
+    },
+}
+
+-- Routed with a bare KEY? Infer the verb from the spoken words
+-- ("start the minecraft server", "stop the mc server", "restart minecraft").
+-- The container is FIXED ("mc-server") — the docker surface is the hardcoded
+-- minecraft_* entries in init.lua, never freeform args.
+function M.execute(cmd)
+    local action = cmd.action
+    if not action or action == "" then
+        local t = (cmd.target or ""):lower()
+        if t:match("restart") then action = "restart"
+        elseif t:match("stop") or t:match("halt") then action = "stop"
+        elseif t:match("status") or t:match("check") then action = "status"
+        else action = "start" end
+    end
+    if action ~= "start" and action ~= "stop" and action ~= "restart" and action ~= "status" then
+        return { status = "error", message = "unknown mc_server action: " .. tostring(action) }
+    end
+
+    local result = rana.spawn("minecraft_" .. action)
+    if result.timed_out then
+        return { status = "error", message = "command timed out" }
+    end
+    if result.exit_code ~= 0 then
+        return { status = "error", message = "docker failed: " .. result.stderr }
+    end
+
+    return { status = "ok", message = result.stdout or "" }
+end
+
+return M

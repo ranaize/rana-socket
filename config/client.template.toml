@@ -1,56 +1,42 @@
-[daemon]
-socket_type = "unix"
+# rana-deploy rana-socket config — host / notebook agent mode (Unix socket).
 # The daemon runs NATIVELY on the host (see rana-deploy/Makefile). It creates the
 # socket under run/rana/ (relative to the rana-deploy dir), which is bind-mounted
 # into the agent container at /run/rana so the agent can forward to it. The daemon
 # drops to uid 1000 (same as the agent) so the 0o600 socket is connectable.
+#
+# Scriptable command model (scripts/<key>.pluto is the command; see
+# scripts/ask.pluto / scripts/talk.pluto for the hop piping):
+#   - [commands.allowed] is the registry. A key is addressable ONLY if it is
+#     listed here AND a matching scripts/<key>.pluto exists (cross-checked by the
+#     daemon at startup). Per-command tuning (description/keywords/timeout) lives
+#     in the script's own meta table (scripts/init.lua), not here.
+
+[daemon]
+socket_type = "unix"
 socket_path = "run/rana/rana-local.sock"
 socket_permissions = 0o600
+# scripts_dir is optional: when omitted the daemon autodiscovers it (walks up from
+# its own binary, then /opt/rana/scripts). Override via the RANA_SCRIPTS_DIR env var.
 
-# Each [commands.<key>] maps a command to an executor. The FlatBuffers union
-# table is derived from the key (CamelCase + "Cmd", e.g. "volume" -> "VolumeCmd",
-# "mc_server" -> "McServerCmd"); "browser" is the one exception -> "LaunchBrowserCmd".
-# You never specify 'variant' in the toml.
+# The command registry. Order does not matter. These are the local device commands
+# the notebook agent can reach directly; `ask`/`talk` ride over the socket to the
+# server-side rana-socketd, which is the ONLY LocalAI caller (see server.template.toml).
+[commands.allowed]
+"volume"   = true
+"browser"  = true
+"speak"    = true
+"lights"   = true
+"media"    = true
 
-[commands.volume]
-type = "script"
-path = "rana-volume.sh"
-# Params are injected as env vars from the strongly-typed fields:
-# LEVEL, MUTE
-timeout_ms = 2000
-description = "set the speaker volume or mute the sound"
-keywords = ["volume", "sound", "mute"]
+# The daemon is the ONLY LocalAI caller. The ask hop (scripts/ask.pluto) reads
+# these to build its request.
+[llm]
+url = "http://127.0.0.1:8080/v1/chat/completions"
+model = "command"
 
-[commands.media]
-type = "script"
-path = "rana-media.sh"
-# ACTION, TARGET
-timeout_ms = 2000
-description = "play, pause, or stop media on a player"
-keywords = ["media", "play", "pause", "kodi", "mpv"]
-
-[commands.browser]
-type = "exec"
-binary = "/usr/bin/xdg-open"
-default_url = "https://duckduckgo.com"
-description = "open the default web browser"
-keywords = ["browser", "open browser"]
-
-[commands.speak]
-type = "exec"
-binary = "/usr/bin/espeak-ng"
-timeout_ms = 5000
-description = "general knowledge, trivia, definitions, math, and facts"
-keywords = ["question", "what", "who", "how"]
-
-[commands.lights]
-type = "script"
-path = "rana-lights.sh"
-# ACTION, ROOM
-timeout_ms = 2000
-description = "toggle the smart lights"
-keywords = ["lights", "light", "lamp"]
-
-# No [commands.ask] here: the notebook daemon is a forwarder. AskCmd rides over
-# the socket to the server-side rana-socketd, which is the ONLY LocalAI caller
-# (see server.toml). The client only needs the local device commands above.
+# On-host STT for TalkCmd. The daemon decodes the audio to a WAV and hands it to
+# scripts/stt.pluto, which POSTs it to this endpoint and returns the transcript.
+[stt]
+url = "http://127.0.0.1:8080/v1/audio/transcriptions"
+model = "talk"
+timeout_ms = 30000

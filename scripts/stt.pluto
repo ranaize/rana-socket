@@ -1,0 +1,89 @@
+-- scripts/stt.pluto
+-- In-process speech-to-text hop. Replaces scripts/rana-stt.sh. talk.pluto calls it
+-- via rana.dispatch("stt", "stt", wav); it posts the WAV as multipart/form-data to
+-- the STT endpoint and returns the transcript. It is NOT edge-addressable (not in
+-- any [commands.allowed]) — scripts reach it in-process regardless, as a hop.
+-- FLAG_LONG_IDLE grants it extra wall-clock on top of timeout_ms (STT is a slow,
+-- blocking upstream call that otherwise eats a large share of the Lua budget).
+
+local rana = require("rana")
+
+local M = {}
+
+M.meta = {
+    name = "Speech-to-text",
+    description = "Transcribe a WAV via the STT endpoint.",
+    actions = { "stt" },
+    timeout_ms = 30000,
+    flags = { rana.flags.LONG_IDLE },
+}
+
+local function clip(s, n)
+    if #s > (n or 2000) then
+        return string.sub(s, 1, (n or 2000)) .. "..."
+    end
+    return s
+end
+
+function M.stt(wav)
+    if not wav or #wav == 0 then
+        rana.log("error", "stt: empty wav payload")
+        return ""
+    end
+
+    local url = rana.get_stt_url()
+    if url == "" then
+        rana.log("error", "stt: get_stt_url() is empty")
+        return ""
+    end
+
+    local model = rana.get_stt_model()
+    if model == "" then
+        model = "talk"
+    end
+
+    -- OpenAI-compatible transcription needs BOTH a `file` and a `model` form
+    -- field. rana.http_post_multipart only sends a single field, so build the
+    -- multipart body here by hand and POST it with the generic rana.http_post
+    -- (raw string + headers). The boundary is fixed but unique enough that the
+    -- embedded WAV bytes will not collide with it.
+    local boundary = "----ranaSttBoundary9Q4kX"
+
+    local body = "--" .. boundary .. "\r\n"
+        .. "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
+        .. model .. "\r\n"
+        .. "--" .. boundary .. "\r\n"
+        .. "Content-Disposition: form-data; name=\"file\"; filename=\"request.wav\"\r\n"
+        .. "Content-Type: audio/wav\r\n\r\n"
+        .. wav .. "\r\n"
+        .. "--" .. boundary .. "--\r\n"
+
+    rana.log("debug", "stt: POST " .. url .. " (model=" .. model .. ", wav=" .. #wav .. " bytes)")
+    local ok, resp = rana.http_post(url, body,
+                                    { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary })
+    if not ok then
+        rana.log("error", "stt: POST failed -> " .. clip(tostring(resp)))
+        return ""
+    end
+
+    local j = rana.json_decode(resp)
+    if j and j.text then
+        local text = tostring(j.text)
+        rana.log("debug", "stt: transcript (" .. #text .. " chars): " .. clip(text, 500)) 
+        return text
+    end
+    rana.log("error", "stt: no text in response (" .. #resp .. " bytes): " .. clip(resp))
+    return ""
+end
+
+-- Daemon-level entry: `stt` is not edge-addressable, but the hop lands here with
+-- the WAV in cmd.target (dispatched binary-safe) or cmd.data.
+function M.execute(cmd)
+    local wav = cmd.target
+    if (wav == nil or #wav == 0) and cmd.data ~= nil and #cmd.data > 0 then
+        wav = cmd.data
+    end
+    return M.stt(wav or "")
+end
+
+return M
