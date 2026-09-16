@@ -50,21 +50,21 @@ forward_only = true
 
 [commands.lights]
 type = "script"
-path = "/usr/local/bin/rana-lights.sh"
+path = "rana-lights.sh"
 description = "toggle the smart lights"
 keywords = ["lights", "light", "lamp"]
 forward_only = true
 
 [commands.volume]
 type = "script"
-path = "/usr/local/bin/rana-volume.sh"
+path = "rana-volume.sh"
 description = "set the speaker volume or mute the sound"
 keywords = ["volume", "sound", "mute"]
 forward_only = true
 
 [commands.media]
 type = "script"
-path = "/usr/local/bin/rana-media.sh"
+path = "rana-media.sh"
 description = "play, pause, or stop media on a player"
 keywords = ["media", "play", "pause", "kodi", "mpv"]
 forward_only = true
@@ -74,7 +74,7 @@ forward_only = true
 # environment (injected by `make server`); default below matches that.
 [commands.ask]
 type = "script"
-path = "/usr/local/bin/rana-ask.sh"
+path = "rana-ask.sh"
 # TEXT passed via argv, never a shell.
 timeout_ms = 30000
 
@@ -82,7 +82,7 @@ timeout_ms = 30000
 # to a WAV and hands it to this hop; the transcript is routed through the ask hop.
 # The daemon runs on the host, so LocalAI is reached via the host-published 8080.
 [stt]
-script = "/usr/local/bin/rana-stt.sh"
+script = "rana-stt.sh"
 url = "http://127.0.0.1:8080"
 model = "talk"
 timeout_ms = 30000

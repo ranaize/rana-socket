@@ -14,7 +14,7 @@ socket_permissions = 0o600
 
 [commands.volume]
 type = "script"
-path = "/usr/local/bin/rana-volume.sh"
+path = "rana-volume.sh"
 # Params are injected as env vars from the strongly-typed fields:
 # LEVEL, MUTE
 timeout_ms = 2000
@@ -23,7 +23,7 @@ keywords = ["volume", "sound", "mute"]
 
 [commands.media]
 type = "script"
-path = "/usr/local/bin/rana-media.sh"
+path = "rana-media.sh"
 # ACTION, TARGET
 timeout_ms = 2000
 description = "play, pause, or stop media on a player"
@@ -45,7 +45,7 @@ keywords = ["question", "what", "who", "how"]
 
 [commands.lights]
 type = "script"
-path = "/usr/local/bin/rana-lights.sh"
+path = "rana-lights.sh"
 # ACTION, ROOM
 timeout_ms = 2000
 description = "toggle the smart lights"
