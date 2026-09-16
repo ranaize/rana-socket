@@ -35,6 +35,17 @@ struct CommandEntry {
     std::string suspend_binary;
     bool requires_confirm = false;
     uint32_t timeout_ms = 5000;
+    // Fuzzy pre-router metadata (used to route a spoken query to this command
+    // before falling back to the LLM). `danger` commands require an EXACT phrase
+    // match (no partial) so a phrase like "shutdown the minecraft server" can
+    // never collapse onto a machine-power command.
+    std::string description;
+    std::vector<std::string> keywords;
+    bool danger = false;
+    // A command the daemon may route/forward but never execute locally (e.g. a
+    // device command owned by the peer). The fuzzy pre-router can still match it
+    // and dispatch_inner forwards it instead of trying to run it here.
+    bool forward_only = false;
 };
 
 struct SttConfig {

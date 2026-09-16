@@ -21,12 +21,53 @@ allowed_ips = ["127.0.0.1", "172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"]
 type = "docker_compose"
 workdir = "/opt/minecraft"
 default_world = "survival"
+description = "start, stop, or restart the Minecraft game server"
+keywords = ["minecraft", "mc server", "minecraft server"]
 
-# [commands.power]
-# type = "system"
-# binary = "/usr/bin/dinitctl"
-# suspend_binary = "/usr/bin/zzz"
-# requires_confirm = true
+# Danger command: only an EXACT phrase match (e.g. "shutdown", "power off",
+# "turn off") routes here. A partial phrase like "shutdown the minecraft server"
+# must NOT collapse onto machine power — it must fall through to mc_server.
+[commands.power]
+type = "system"
+binary = "/usr/bin/dinitctl"
+suspend_binary = "/usr/bin/zzz"
+requires_confirm = true
+description = "shut down or reboot this machine"
+keywords = ["shutdown", "power off", "turn off"]
+danger = true
+
+# Forward-only mirrors of the client's device commands. The server runs STT, so
+# its fuzzy pre-router needs these described here to match them and forward the
+# resulting Command to the client (which actually owns the executors). They are
+# never executed on the server (forward_only = true).
+[commands.browser]
+type = "exec"
+binary = "/usr/bin/xdg-open"
+default_url = "https://duckduckgo.com"
+description = "open the default web browser"
+keywords = ["browser", "open browser"]
+forward_only = true
+
+[commands.lights]
+type = "script"
+path = "/usr/local/bin/rana-lights.sh"
+description = "toggle the smart lights"
+keywords = ["lights", "light", "lamp"]
+forward_only = true
+
+[commands.volume]
+type = "script"
+path = "/usr/local/bin/rana-volume.sh"
+description = "set the speaker volume or mute the sound"
+keywords = ["volume", "sound", "mute"]
+forward_only = true
+
+[commands.media]
+type = "script"
+path = "/usr/local/bin/rana-media.sh"
+description = "play, pause, or stop media on a player"
+keywords = ["media", "play", "pause", "kodi", "mpv"]
+forward_only = true
 
 # The daemon is the ONLY LocalAI caller. AskCmd.text rides here to the ask hop
 # script over the socket en route to LocalAI. The hop reads ASK_LLM_URL from the

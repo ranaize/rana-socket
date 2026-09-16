@@ -19,7 +19,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "protocol.h"
 
@@ -42,6 +45,144 @@ const char* payload_name(CommandPayload t) {
         case CommandPayload_NONE:             return "NONE";
         default:                              return "?";
     }
+}
+
+// ─── Fuzzy pre-router ──────────────────────────────────────────────────────
+// A spoken query is first matched here (lexically) against the configured
+// command descriptions/keywords. Only if nothing confident matches do we fall
+// back to the LLM. Danger commands (e.g. machine power) require an EXACT phrase
+// match, so a partial sentence such as "shutdown the minecraft server" can never
+// collapse onto the power command.
+
+std::vector<std::string> tokenize(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            cur += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        } else if (!cur.empty()) {
+            out.push_back(cur);
+            cur.clear();
+        }
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+// Flattened, whitespace-joined, lowercased phrase — used for exact matching.
+std::string norm_phrase(const std::string& s) {
+    std::string out;
+    for (const auto& t : tokenize(s)) {
+        out += t;
+        out += ' ';
+    }
+    if (!out.empty()) out.pop_back();
+    return out;
+}
+
+// Function words that carry no routing intent. They appear in nearly every
+// command description ("the", "set", "turn"…), so including them in the overlap
+// score produces false matches against unrelated queries. Strip them from both
+// the transcript and the command corpus before scoring.
+const std::set<std::string>& stopwords() {
+    static const std::set<std::string> s = {
+        "the", "a", "an", "of", "to", "on", "in", "for", "with", "and", "or",
+        "is", "are", "be", "am", "my", "your", "our", "their", "please", "can",
+        "could", "would", "should", "will", "you", "i", "it", "this", "that",
+        "these", "those", "what", "who", "how", "why", "when", "where", "do",
+        "does", "did", "have", "has", "some", "any", "into", "from", "at", "by",
+        "as", "so", "if", "then", "about", "me", "we", "they", "he", "she",
+        "turn", "set", "make", "get", "got", "close", "just", "now",
+    };
+    return s;
+}
+
+std::vector<std::string> drop_stopwords(std::vector<std::string> toks) {
+    toks.erase(std::remove_if(toks.begin(), toks.end(),
+                   [](const std::string& t) { return stopwords().count(t) > 0; }),
+               toks.end());
+    return toks;
+}
+
+// Meaningful-token phrase used for exact (danger) matching — stopwords removed so
+// "turn off" (keyword) doesn't falsely equal "turn off the lights" (query).
+std::string norm_meaningful(const std::string& s) {
+    std::string out;
+    for (const auto& t : drop_stopwords(tokenize(s))) {
+        out += t;
+        out += ' ';
+    }
+    if (!out.empty()) out.pop_back();
+    return out;
+}
+
+size_t overlap_count(const std::vector<std::string>& haystack,
+                     const std::vector<std::string>& needles) {
+    std::set<std::string> hs(haystack.begin(), haystack.end());
+    size_t n = 0;
+    for (const auto& t : needles) if (hs.count(t)) ++n;
+    return n;
+}
+
+bool contains_word(const std::string& s, const char* w) {
+    for (const auto& t : tokenize(s)) if (t == w) return true;
+    return false;
+}
+
+// Config key -> the canonical action keyword the router dispatches on.
+std::string canonical_action(const std::string& key) {
+    if (key == "speak")     return "reply";
+    if (key == "browser")   return "open_browser";
+    if (key == "lights")    return "toggle_lights";
+    if (key == "power")     return "shutdown";
+    if (key == "mc_server") return "open_minecraft";
+    if (key == "volume")    return "set_volume";
+    if (key == "media")     return "media_control";
+    return key;
+}
+
+// Returns the [commands.<key>] that best matches `transcript`, or "" if none.
+// `speak`/`ask` are intentionally skipped: they need the LLM (answer text or
+// the hop itself) and must not be short-circuited by lexical matching.
+std::string fuzzy_best_command(const std::string& transcript,
+                               const std::map<std::string, CommandEntry>& cmds) {
+    const auto qt = drop_stopwords(tokenize(transcript));
+    if (qt.empty()) return "";
+    const std::string qnorm = norm_meaningful(transcript);
+
+    // 1) Danger commands: only an exact phrase match qualifies.
+    for (const auto& [key, e] : cmds) {
+        if (key == "ask" || key == "speak" || !e.danger) continue;
+        for (const auto& kw : e.keywords) {
+            if (norm_meaningful(kw) == qnorm) return key;
+        }
+    }
+
+    // 2) Non-danger commands: best lexical overlap on meaningful tokens.
+    // Require at least one overlapping meaningful token, and roughly half the
+    // query's meaningful tokens, so a single common word can't trigger a false
+    // route. ("open minecraft server" -> 3 tokens, need 2; "open browser" -> 2,
+    // need 1.)
+    const size_t qn = qt.size();
+    const size_t need = qn <= 2 ? 1 : (qn + 1) / 2;
+    std::string best;
+    size_t best_score = 0;
+    for (const auto& [key, e] : cmds) {
+        if (key == "ask" || key == "speak" || e.danger) continue;
+        if (e.description.empty() && e.keywords.empty()) continue;
+
+        std::vector<std::string> corpus = drop_stopwords(tokenize(e.description));
+        for (const auto& kw : e.keywords) {
+            auto kt = drop_stopwords(tokenize(kw));
+            corpus.insert(corpus.end(), kt.begin(), kt.end());
+        }
+        const size_t ov = overlap_count(qt, corpus);
+        if (ov >= need && ov > best_score) {
+            best = key;
+            best_score = ov;
+        }
+    }
+    return best;
 }
 
 struct SpawnResult {
@@ -407,7 +548,11 @@ Result Executor::run_browser(const LaunchBrowserCmd* cmd) {
     const CommandEntry* entry = lookup("browser", "LaunchBrowserCmd", fail);
     if (entry == nullptr) return fail;
 
-    const std::string url = (cmd != nullptr && cmd->url()) ? cmd->url()->str() : entry->default_url;
+    // An explicit url may be empty (e.g. forwarded from a command with no args);
+    // treat an empty url the same as "not supplied" and fall back to default_url.
+    std::string url;
+    if (cmd != nullptr && cmd->url()) url = cmd->url()->str();
+    if (url.empty()) url = entry->default_url;
     if (url.empty()) {
         return {Status_INVALID_PAYLOAD, "no url supplied and no default configured"};
     }
@@ -580,6 +725,18 @@ RunOutcome Executor::run_talk(const TalkCmd* cmd) {
     while (!transcript.empty() && std::isspace(static_cast<unsigned char>(transcript.back())))
         transcript.pop_back();
     rana::log_msg("talk", "run_talk: transcript=%s", transcript.c_str());
+
+    // Pre-LLM fuzzy route: if the transcript lexically matches a configured
+    // command, dispatch it directly (skipping the LLM hop entirely). The LLM
+    // remains the general fallback for everything else.
+    if (const std::string key = fuzzy_best_command(transcript, cfg_.commands); !key.empty()) {
+        rana::log_msg("fuzzy", "transcript routed to [commands.%s] before LLM", key.c_str());
+        // For mc_server the transcript carries the start/stop/restart intent;
+        // other commands have no args, so an empty payload uses their TOML
+        // defaults (default_world / default_url / Toggle / ...).
+        const std::string payload = (key == "mc_server") ? transcript : std::string();
+        return dispatch_inner(canonical_action(key), payload);
+    }
     return run_ask_text(transcript);
 }
 
@@ -596,6 +753,9 @@ RunOutcome Executor::dispatch_inner(const std::string& action, const std::string
     else if (a == "SpeakCmd")                       a = "reply";
     else if (a == "PowerCmd")                       a = "shutdown";
     else if (a == "LightCmd")                       a = "toggle_lights";
+    else if (a == "McServerCmd" || a == "mc_server")        a = "open_minecraft";
+    else if (a == "VolumeCmd"  || a == "volume")            a = "set_volume";
+    else if (a == "MediaCmd"   || a == "media")             a = "media_control";
 
     flatbuffers::FlatBufferBuilder b(256);
     CommandPayload type = CommandPayload_NONE;
@@ -625,6 +785,25 @@ RunOutcome Executor::dispatch_inner(const std::string& action, const std::string
         up = CreatePowerCmd(b, PowerAction_Shutdown, /*confirm=*/true).Union();
         type = CommandPayload_PowerCmd;
         cfg_key = "power";
+    } else if (a == "open_minecraft") {
+        // Action is inferred from wording (start/stop/restart). The world comes
+        // from the TOML default_world; the transcript/payload only steers action.
+        McAction act = McAction_Start;
+        if (contains_word(payload, "restart"))      act = McAction_Restart;
+        else if (contains_word(payload, "stop") || contains_word(payload, "halt") ||
+                 contains_word(payload, "shutdown"))
+            act = McAction_Stop;
+        up = CreateMcServerCmd(b, act, 0).Union();
+        type = CommandPayload_McServerCmd;
+        cfg_key = "mc_server";
+    } else if (a == "set_volume") {
+        up = CreateVolumeCmd(b, /*level=*/50, /*mute=*/false).Union();
+        type = CommandPayload_VolumeCmd;
+        cfg_key = "volume";
+    } else if (a == "media_control") {
+        up = CreateMediaCmd(b, MediaAction_Play, b.CreateString("")).Union();
+        type = CommandPayload_MediaCmd;
+        cfg_key = "media";
     } else {
         RunOutcome o; o.result = {Status_UNKNOWN_COMMAND, "ask returned unknown action: " + action};
         return o;
@@ -644,7 +823,7 @@ RunOutcome Executor::dispatch_inner(const std::string& action, const std::string
     rana::log_msg("dispatch", "action=%s cfg_key=%s variant=%s -> %s", a.c_str(),
                   cfg_key.c_str(), variant.c_str(),
                   entry ? "execute-locally" : "forward-to-client");
-    if (entry == nullptr) {
+    if (entry == nullptr || entry->forward_only) {
         RunOutcome fwd;
         fwd.forward_to_client = true;
         fwd.forward_cmd = std::move(inner);

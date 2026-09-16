@@ -15,7 +15,7 @@ const std::set<std::string> kDaemonKeys = {
 };
 
 std::set<std::string> allowed_command_keys(const std::string& type) {
-    std::set<std::string> keys = {"type", "timeout_ms"};
+    std::set<std::string> keys = {"type", "timeout_ms", "description", "keywords", "danger", "forward_only"};
     if (type == "script") {
         keys.insert("path");
         keys.insert("default_subnet");
@@ -134,6 +134,14 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
                 entry.requires_confirm = t->at_path("requires_confirm").value_or(false);
                 entry.timeout_ms =
                     static_cast<uint32_t>(t->at_path("timeout_ms").value_or(int64_t{5000}));
+                entry.description = t->at_path("description").value_or(std::string());
+                entry.danger = t->at_path("danger").value_or(false);
+                entry.forward_only = t->at_path("forward_only").value_or(false);
+                if (const auto* arr = t->at_path("keywords").as_array()) {
+                    for (const auto& el : *arr) {
+                        if (auto s = el.value<std::string>()) entry.keywords.push_back(*s);
+                    }
+                }
                 out.commands.emplace(key, std::move(entry));
             }
         }

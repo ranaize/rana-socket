@@ -18,28 +18,38 @@ path = "/usr/local/bin/rana-volume.sh"
 # Params are injected as env vars from the strongly-typed fields:
 # LEVEL, MUTE
 timeout_ms = 2000
+description = "set the speaker volume or mute the sound"
+keywords = ["volume", "sound", "mute"]
 
 [commands.media]
 type = "script"
 path = "/usr/local/bin/rana-media.sh"
 # ACTION, TARGET
 timeout_ms = 2000
+description = "play, pause, or stop media on a player"
+keywords = ["media", "play", "pause", "kodi", "mpv"]
 
 [commands.browser]
 type = "exec"
 binary = "/usr/bin/xdg-open"
 default_url = "https://duckduckgo.com"
+description = "open the default web browser"
+keywords = ["browser", "open browser"]
 
 [commands.speak]
 type = "exec"
 binary = "/usr/bin/espeak-ng"
 timeout_ms = 5000
+description = "general knowledge, trivia, definitions, math, and facts"
+keywords = ["question", "what", "who", "how"]
 
 [commands.lights]
 type = "script"
 path = "/usr/local/bin/rana-lights.sh"
 # ACTION, ROOM
 timeout_ms = 2000
+description = "toggle the smart lights"
+keywords = ["lights", "light", "lamp"]
 
 # No [commands.ask] here: the notebook daemon is a forwarder. AskCmd rides over
 # the socket to the server-side rana-socketd, which is the ONLY LocalAI caller

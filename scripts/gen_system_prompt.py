@@ -24,7 +24,19 @@ def main() -> int:
         cfg = tomllib.load(fh)
 
     cmds = cfg.get("commands", {})
-    has = lambda k: k in cmds  # noqa: E731
+
+    # The router's canonical keyword per config key — must stay in sync with
+    # canonical_action() in executor.cpp. Used so the LLM emits the keyword the
+    # daemon's dispatch_inner() expects (never the FlatBuffer variant name).
+    CANON = {
+        "speak": "reply",
+        "browser": "open_browser",
+        "lights": "toggle_lights",
+        "power": "shutdown",
+        "mc_server": "open_minecraft",
+        "volume": "set_volume",
+        "media": "media_control",
+    }
 
     lines = [
         'You are a strict voice command routing engine. Output ONLY raw JSON: '
@@ -32,32 +44,38 @@ def main() -> int:
         "",
         "# NOTE: this action vocabulary is wired to the rana-socketd daemon. "
         'ALWAYS emit one of these KEYWORDS in the "action" field — never the '
-        'FlatBuffer variant name: "reply", "open_browser", "search_web", '
-        '"toggle_lights", "shutdown".',
+        'FlatBuffer variant name.',
         "",
         '"action" rules:',
     ]
-
-    if has("speak"):
-        lines.append(
-            '- "reply": USE THIS FOR ALL GENERAL KNOWLEDGE, trivia, definitions, '
-            "math, and historical facts.")
-    if has("browser"):
-        lines.append(
-            '- "search_web": DO NOT use for general knowledge. Use ONLY for '
-            "real-time/time-sensitive live data (current weather, breaking news, "
-            "live sports scores, current stock prices).")
-        lines.append(
-            '- "open_browser": open the default web browser (device trigger; '
-            'payload must be "").')
-    if has("lights"):
-        lines.append(
-            '- "toggle_lights": toggle the lights (device trigger; payload must '
-            'be "").')
-    if has("power"):
-        lines.append(
-            '- "shutdown": shut down the machine (device trigger; payload must '
-            'be "").')
+    # The daemon runs a fuzzy lexical pre-router first; these are the actions it
+    # can already handle without you. Emit the matching keyword when the user's
+    # intent clearly fits one; otherwise fall back to "reply".
+    for key in cmds:
+        if key == "ask":
+            continue
+        kw = CANON.get(key, key)
+        entry = cmds[key]
+        desc = entry.get("description") or (key.replace("_", " ") + " command")
+        if key == "speak":
+            lines.append(
+                '- "reply": USE THIS FOR ALL GENERAL KNOWLEDGE, trivia, '
+                "definitions, math, and historical facts. " + desc)
+        elif key == "browser":
+            lines.append(
+                '- "search_web": DO NOT use for general knowledge. Use ONLY for '
+                "real-time/time-sensitive live data (current weather, breaking "
+                'news, live sports scores, current stock prices).')
+            lines.append(
+                '- "open_browser": ' + desc + ' (device trigger; payload must be "").')
+        elif key == "lights":
+            lines.append(
+                '- "toggle_lights": ' + desc + ' (device trigger; payload must be "").')
+        elif key == "power":
+            lines.append(
+                '- "shutdown": ' + desc + ' (device trigger; payload must be "").')
+        else:
+            lines.append('- "%s": %s' % (kw, desc))
 
     lines.append(
         'If the request fits none of the above, use "reply" with a short spoken '

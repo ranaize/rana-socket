@@ -47,8 +47,4 @@ chmod = 755
 chown_user = true
 artifacts = [
   { source = "root://socket/bin/Release/rana-socketd", dest = "rana-socketd" },
-  { source = "root://serializer/bin/Release/rana-serializer", dest = "rana-serializer" },
-  { source = "root://scripts/rana-ask.sh", dest = "rana-ask.sh" },
-  { source = "root://scripts/rana-stt.sh", dest = "rana-stt.sh" },
-  { source = "root://scripts/gen_system_prompt.py", dest = "gen_system_prompt.py" },
 ]
