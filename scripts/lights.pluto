@@ -1,7 +1,9 @@
 -- scripts/lights.pluto
 -- key = "lights". Smart-home light control via the deployment's `lights` backend.
 
-local rana = require("rana")
+local exec = require("lib.exec")
+local result = require("lib.result")
+local verbs = require("lib.verbs")
 
 local M = {}
 
@@ -30,16 +32,11 @@ function M.execute(cmd)
     local action = cmd.action
     local room = cmd.target or ""
     if not action or action == "" then
-        local t = (room or ""):lower()
-        if t:match("turn%-?off") or t:match("off the lights") or t:match("%f[%a]off%f[^%a]") then
-            action = "off"
-        elseif t:match("turn%-?on") or t:match("%f[%a]on%f[^%a]") or t:match("^on ") then
-            action = "on"
-        elseif t:match("color") then
-            action = "color"
-        else
-            action = "toggle"
-        end
+        action = verbs.infer(room, {
+            { verb = "off",   patterns = { "turn%-?off", "off the lights", "%f[%a]off%f[^%a]" } },
+            { verb = "on",    patterns = { "turn%-?on", "%f[%a]on%f[^%a]", "^on " } },
+            { verb = "color", patterns = { "color" } },
+        }, "toggle")
         room = ""   -- room was the spoken phrase, not a zone id
     end
     if room == "" then room = "all" end
@@ -49,15 +46,12 @@ function M.execute(cmd)
         table.insert(args, cmd.params and cmd.params.color or "")
     end
 
-    local result = rana.spawn("lights", table.unpack(args))
-    if result.timed_out then
-        return { status = "error", message = "command timed out" }
-    end
-    if result.exit_code ~= 0 then
-        return { status = "error", message = "lights failed: " .. result.stderr }
+    local ok, res = exec.run("lights", table.unpack(args))
+    if not ok then
+        return result.error(res)
     end
 
-    return { status = "ok", message = "lights " .. action .. " " .. room }
+    return result.ok("lights " .. action .. " " .. room)
 end
 
 return M

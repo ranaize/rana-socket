@@ -86,6 +86,9 @@ COPY --from=builder /src/vendor/pluto/src/libpluto.so /usr/local/bin/libpluto.so
 # Self-describing scripts + the system-interface registry. No shell hops, no python.
 COPY --from=builder /src/scripts/init.lua /opt/rana/scripts/init.lua
 COPY --from=builder /src/scripts/*.pluto /opt/rana/scripts/
+# Shared helpers required as lib/<name> by the scripts (resolved by the bridge's
+# restricted searcher); without these every script that requires one fails to load.
+COPY --from=builder /src/scripts/lib/ /opt/rana/scripts/lib/
 # The daemon build regenerates command_generated.py from command.fbs via flatc;
 # export it so the agent's Python client stays in lockstep with the daemon's
 # compiled C++ schema (same status codes) and never drifts.

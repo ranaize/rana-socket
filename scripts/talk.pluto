@@ -9,6 +9,7 @@
 -- client daemon). Edit or replace this file to change the voice pipeline.
 
 local rana = require("rana")
+local result = require("lib.result")
 
 local M = {}
 
@@ -31,7 +32,7 @@ M.meta = {
 function M.execute(cmd)
     local audio = cmd.data or ""
     if #audio == 0 then
-        return { status = "invalid_payload", message = "no audio" }
+        return result.invalid("no audio")
     end
 
     local encoding = "pcm16"
@@ -46,7 +47,7 @@ function M.execute(cmd)
     -- Decode the raw payload to WAV; the codec lives in C++ (rana.audio module).
     local wav = rana.audio.decode_to_wav(audio, encoding, sample_rate, channels)
     if not wav or #wav == 0 then
-        return { status = "invalid_payload", message = "unsupported audio encoding: " .. encoding }
+        return result.invalid("unsupported audio encoding: " .. encoding)
     end
 
     -- STT hop (scripts/stt.pluto): the WAV rides in the args table's `target`
@@ -54,7 +55,7 @@ function M.execute(cmd)
     -- [commands.allowed]). Returns {status, message} with the transcript in `message`.
     local t = rana.dispatch("stt", "stt", { target = wav, internal = true })
     if type(t) ~= "table" or t.status ~= "ok" or not t.message or t.message == "" then
-        return { status = "execution_failed", message = "stt returned nothing" }
+        return result.error("stt returned nothing")
     end
 
     -- Ask hop (scripts/ask.pluto): it owns the reply/intent routing, so the

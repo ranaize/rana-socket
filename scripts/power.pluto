@@ -2,7 +2,9 @@
 -- key = "power". Host power management via the fixed-argv sudo entries
 -- (shutdown/reboot/suspend in init.lua).
 
-local rana = require("rana")
+local exec = require("lib.exec")
+local result = require("lib.result")
+local verbs = require("lib.verbs")
 
 local M = {}
 
@@ -31,37 +33,36 @@ M.meta = {
 function M.execute(cmd)
     local action = cmd.action
     if not action or action == "" then
-        -- Fold runs of spaces/hyphens into a single space so "shut down",
-        -- "shut-down" and "shutdown" all read as "shut down". Mirrors the
-        -- danger keywords that can route here.
-        local t = (cmd.target or ""):lower():gsub("[%s%-]+", " ")
-        if t:match("shut[%w%s]-down") or t:match("power[%w%s]-down")
-           or t:match("shutdown") or t:match("power[%w%s]-off") then
-            action = "shutdown"
-        elseif t:match("reboot") or t:match("restart") then
-            action = "reboot"
-        elseif t:match("suspend") or t:match("sleep") then
-            action = "suspend"
-        else
+        action = verbs.infer(cmd.target, {
+            { verb = "shutdown", patterns = { "shut[%w%s]-down", "power[%w%s]-down",
+                                              "shutdown", "power[%w%s]-off" } },
+            { verb = "reboot",   patterns = { "reboot", "restart" } },
+            { verb = "suspend",  patterns = { "suspend", "sleep" } },
+        }, nil)
+        if not action then
             -- Never guess-and-suspend: an unrecognized power request fails closed.
-            return { status = "error", message = "unrecognized power request" }
+            return result.error("unrecognized power request")
         end
     end
     if action ~= "shutdown" and action ~= "reboot" and action ~= "suspend" then
-        return { status = "error", message = "unknown power action: " .. tostring(action) }
+        return result.error("unknown power action: " .. tostring(action))
+    end
+
+    -- Destructive: the client confirms out of band and sets params.confirm
+    -- ("true"). An unconfirmed request (e.g. one routed by voice through ask)
+    -- fails closed rather than shutting the machine down implicitly.
+    if not (cmd.params and cmd.params.confirm) then
+        return result.safety("power " .. action .. " requires confirmation")
     end
 
     -- Fixed argv-backed verbs (init.lua entries shutdown/reboot/suspend run sudo -n
     -- with hardcoded arguments); we only pick the entry name, never args.
-    local result = rana.spawn(action)
-    if result.timed_out then
-        return { status = "error", message = "command timed out" }
-    end
-    if result.exit_code ~= 0 then
-        return { status = "error", message = "power failed: " .. result.stderr }
+    local ok, res = exec.run(action)
+    if not ok then
+        return result.error(res)
     end
 
-    return { status = "ok", message = "power " .. action }
+    return result.ok("power " .. action)
 end
 
 return M

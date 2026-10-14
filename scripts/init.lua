@@ -1,8 +1,8 @@
 -- scripts/init.lua
 -- Executed once at daemon startup, before any command scripts. Defines the
--- system interface: which binaries/endpoints scripts may reach, the constants
--- they can read, and the filesystem sandbox. This is the single source of truth
--- for the security boundary — the scripts never touch os/io/package/debug.
+-- system interface: which binaries and network endpoints scripts may reach.
+-- This is the single source of truth for the escape-hatch boundary — the scripts
+-- never touch os/io/package/debug.
 
 local rana = require("rana")
 
@@ -44,22 +44,8 @@ rana.allow_endpoints({
 	{ scheme = "http", host = "localai", port = 8080 },
 })
 
--- Global constants accessible to all scripts.
-rana.set_constants({
-	config_path = rana.get_config_path(),
-	socket_path = rana.get_socket_path(),
-	llm_url = rana.get_llm_url(),
-	llm_model = rana.get_llm_model(),
-	stt_url = rana.get_stt_url(),
-	stt_model = rana.get_stt_model(),
-})
-
--- Filesystem sandbox: scripts may read script sources and write only to their own
--- per-command scratch directory. Enforced by the C bridge.
-rana.set_fs_whitelist({
-	rana.get_workdir() .. "/scripts/",
-	rana.get_workdir() .. "/scripts/*/scratch/",
-})
-
 -- NOTE: no command/variant registration here. The registry is [commands.allowed]
 -- in TOML plus the scripts/ scan; each script self-describes via its meta table.
+-- Scripts also share reviewed helpers from scripts/lib/*.lua via
+-- require("lib.<name>") (resolved by a restricted searcher that reads only that
+-- directory).

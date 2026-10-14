@@ -137,18 +137,16 @@ public:
 
     const std::map<std::string, BinaryEntry>& binaries() const;
     const std::vector<Endpoint>& endpoints() const;
+    // Wall-clock budget for a single script run. `current_timeout()` is the
+    // script's own meta.timeout_ms (used to bound rana.spawn children);
+    // `current_etl_timeout()` adds the FLAG_LONG_IDLE grant and is what bounds
+    // the Pluto VM deadline and blocking HTTP hops (ask/stt).
     uint32_t current_timeout() const;
-    const std::string& current_key() const;
-    const std::string& current_action() const;
-    const std::string& current_target() const;
-    const std::map<std::string, std::string>& current_params() const;
-    std::string current_data_str() const;
+    uint32_t current_etl_timeout() const;
 
     // Registry mutators invoked by init.lua.
     void allow_binaries(const std::map<std::string, BinaryEntry>& m);
     void allow_endpoints(const std::vector<std::tuple<std::string, std::string, int>>& v);
-    void set_fs_whitelist(const std::vector<std::string>& v);
-    void set_constants(const std::map<std::string, std::string>& m);
     void register_script_meta(const std::string& key, const std::string& name,
                              const std::string& description,
                              const std::vector<std::string>& actions,
@@ -182,17 +180,12 @@ private:
     std::set<std::string> allowed_;
     std::map<std::string, BinaryEntry> binaries_;
     std::vector<Endpoint> endpoints_;
-    std::vector<std::string> fs_whitelist_;
-    std::map<std::string, std::string> constants_;
     std::map<std::string, ScriptMeta> metas_;
 
-    // Per-dispatch context available to scripts via rana.fetch_command.
-    std::string current_key_;
-    std::string current_action_;
-    std::string current_target_;
+    // Params for the script currently on the stack, used to build its cmd table.
     std::map<std::string, std::string> current_params_;
-    std::vector<uint8_t> current_data_;
     uint32_t current_timeout_ = 5000;
+    uint32_t current_etl_timeout_ = 5000;
 
     // Nesting depth of run_command (1 = outermost edge dispatch). rana.dispatch
     // hops re-enter run_command; pending_respond_ must survive them and be

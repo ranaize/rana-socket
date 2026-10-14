@@ -8,7 +8,7 @@
 #     listed here AND a matching scripts/<key>.pluto exists (cross-checked by the
 #     daemon at startup).
 #   - `ask` and `talk` are scripts like any other (scripts/ask.pluto,
-#     scripts/talk.pluto → scripts/stt.pluto); ask/talk/run_stt are in-process
+#     scripts/talk.pluto → scripts/stt.pluto); ask/talk/stt are in-process
 #     Pluto hops, not shell scripts. The daemon owns all LocalAI/STT calls.
 #   - Each script self-describes (meta) and the actual executables it may reach
 #     are whitelisted in scripts/init.lua, not here.

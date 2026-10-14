@@ -96,10 +96,10 @@ bool build_command(const std::string& cmd, int argc, char** argv,
     }
 
     if (cmd == "power") {
-        if (argc < 4) return usage_err("usage: rana-socket-client <addr> power <shutdown|standby|reboot> [--confirm]");
+        if (argc < 4) return usage_err("usage: rana-socket-client <addr> power <shutdown|reboot|suspend> [--confirm]");
         const std::string_view a = argv[3];
-        if (a != "shutdown" && a != "standby" && a != "reboot")
-            return usage_err("power: action must be shutdown|standby|reboot");
+        if (a != "shutdown" && a != "reboot" && a != "suspend")
+            return usage_err("power: action must be shutdown|reboot|suspend");
         const bool confirm = argc >= 5 && std::string_view(argv[4]) == "--confirm";
         ParamList params;
         if (confirm) params.emplace_back("confirm", "true");

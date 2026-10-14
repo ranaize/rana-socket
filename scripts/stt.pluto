@@ -7,6 +7,7 @@
 -- blocking upstream call that otherwise eats a large share of the Lua budget).
 
 local rana = require("rana")
+local multipart = require("lib.multipart")
 
 local M = {}
 
@@ -43,24 +44,14 @@ function M.stt(wav)
     end
 
     -- OpenAI-compatible transcription needs BOTH a `file` and a `model` form
-    -- field. rana.http_post_multipart only sends a single field, so build the
-    -- multipart body here by hand and POST it with the generic rana.http_post
-    -- (raw string + headers). The boundary is fixed but unique enough that the
-    -- embedded WAV bytes will not collide with it.
-    local boundary = "----ranaSttBoundary9Q4kX"
-
-    local body = "--" .. boundary .. "\r\n"
-        .. "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
-        .. model .. "\r\n"
-        .. "--" .. boundary .. "\r\n"
-        .. "Content-Disposition: form-data; name=\"file\"; filename=\"request.wav\"\r\n"
-        .. "Content-Type: audio/wav\r\n\r\n"
-        .. wav .. "\r\n"
-        .. "--" .. boundary .. "--\r\n"
+    -- field; lib/multipart builds that body for the generic rana.http_post.
+    local body, ctype = multipart.build({
+        { name = "model", value = model },
+        { name = "file", filename = "request.wav", content_type = "audio/wav", value = wav },
+    })
 
     rana.log("debug", "stt: POST " .. url .. " (model=" .. model .. ", wav=" .. #wav .. " bytes)")
-    local ok, resp = rana.http_post(url, body,
-                                    { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary })
+    local ok, resp = rana.http_post(url, body, { ["Content-Type"] = ctype })
     if not ok then
         rana.log("error", "stt: POST failed -> " .. clip(tostring(resp)))
         return ""

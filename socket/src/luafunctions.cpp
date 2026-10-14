@@ -4,7 +4,6 @@
 
 #include "luafunctions.h"
 
-#include "ask_reply_generated.h"
 #include "audio.hpp"
 
 #include <lua.h>
@@ -21,6 +20,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <map>
 #include <set>
@@ -501,6 +502,24 @@ struct Url {
     int port = 0;
 };
 
+// strtol-based integer parse that reports failure instead of throwing (these
+// run inside a lua_CFunction; a stray exception must never cross that boundary).
+bool parse_int(const std::string& s, long& out, int base = 10) {
+    if (s.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    const long v = std::strtol(s.c_str(), &end, base);
+    if (errno != 0 || end == s.c_str()) return false;
+    // Tolerate trailing whitespace / chunk extensions (";ext").
+    while (*end == ' ' || *end == '\t' || *end == ';') {
+        ++end;
+        while (*end && *end != ';') ++end;
+    }
+    if (*end != '\0') return false;
+    out = v;
+    return true;
+}
+
 bool parse_url(const std::string& raw, Url& u, std::string& err) {
     size_t sp = raw.find("://");
     if (sp == std::string::npos) { err = "missing scheme"; return false; }
@@ -512,20 +531,40 @@ bool parse_url(const std::string& raw, Url& u, std::string& err) {
     size_t colon = authority.find(':');
     if (colon == std::string::npos) {
         u.host = authority;
-        u.port = (u.scheme == "https") ? 443 : 80;
+        u.port = 80;
     } else {
         u.host = authority.substr(0, colon);
-        u.port = std::stoi(authority.substr(colon + 1));
+        long p = 0;
+        if (!parse_int(authority.substr(colon + 1), p) || p <= 0 || p > 65535) {
+            err = "invalid port";
+            return false;
+        }
+        u.port = static_cast<int>(p);
     }
-    if (u.scheme != "http" && u.scheme != "https") { err = "unsupported scheme"; return false; }
+    // http_do speaks plaintext HTTP only; do not silently accept https and then
+    // connect in the clear. TLS is a future extension.
+    if (u.scheme != "http") { err = "unsupported scheme (http only)"; return false; }
+    if (u.host.empty()) { err = "missing host"; return false; }
     return true;
+}
+
+// Set a receive/send deadline so a stalled upstream can never hang the
+// single-threaded daemon inside recv(). timeout_ms == 0 disables the deadline.
+void set_socket_timeout(int fd, uint32_t timeout_ms) {
+    if (timeout_ms == 0) return;
+    struct timeval tv{};
+    tv.tv_sec = static_cast<time_t>(timeout_ms / 1000);
+    tv.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000) * 1000);
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 // Returns (status_code, body). On transport failure status is 0.
 std::pair<int, std::string> http_do(const std::string& method, const std::string& url,
                                     const std::map<std::string, std::string>& headers,
                                     const std::string& body,
-                                    const std::vector<LuaRuntime::Endpoint>& allow) {
+                                    const std::vector<LuaRuntime::Endpoint>& allow,
+                                    uint32_t timeout_ms) {
     std::string err;
     Url u;
     if (!parse_url(url, u, err)) return {0, std::string("url error: ") + err};
@@ -550,6 +589,7 @@ std::pair<int, std::string> http_do(const std::string& method, const std::string
     for (addrinfo* ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
+        set_socket_timeout(fd, timeout_ms);
         if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
         ::close(fd);
         fd = -1;
@@ -558,7 +598,8 @@ std::pair<int, std::string> http_do(const std::string& method, const std::string
     if (fd < 0) return {0, "connect failed"};
 
     std::string req = method + " " + u.path + " HTTP/1.1\r\n";
-    req += "Host: " + u.host + "\r\n";
+    // Host carries the port when it is not the scheme default.
+    req += "Host: " + u.host + (u.port == 80 ? "" : ":" + std::to_string(u.port)) + "\r\n";
     req += "Connection: close\r\n";
     if (headers.find("Content-Type") == headers.end())
         req += "Content-Type: application/json\r\n";
@@ -590,7 +631,8 @@ std::pair<int, std::string> http_do(const std::string& method, const std::string
 
     int status = 0;
     if (head.size() >= 12 && head.compare(0, 5, "HTTP/") == 0) {
-        status = std::stoi(head.substr(9, 3));
+        long code = 0;
+        if (parse_int(head.substr(9, 3), code)) status = static_cast<int>(code);
     }
 
     // De-chunk if needed.
@@ -601,10 +643,11 @@ std::pair<int, std::string> http_do(const std::string& method, const std::string
         while (pos < body_out.size()) {
             size_t nl = body_out.find("\r\n", pos);
             if (nl == std::string::npos) break;
-            size_t sz = std::stoul(body_out.substr(pos, nl - pos), nullptr, 16);
+            long sz = 0;
+            if (!parse_int(body_out.substr(pos, nl - pos), sz, 16) || sz < 0) break;
             if (sz == 0) break;
-            decoded += body_out.substr(nl + 2, sz);
-            pos = nl + 2 + sz + 2;
+            decoded += body_out.substr(nl + 2, static_cast<size_t>(sz));
+            pos = nl + 2 + static_cast<size_t>(sz) + 2;
         }
         body_out = decoded;
     }
@@ -614,27 +657,10 @@ std::pair<int, std::string> http_do(const std::string& method, const std::string
 }  // namespace
 
 // ───────────────────────────────────────────────────────────────────────
-// FlatBuffers reply/response builders
+// Bridge status helpers
 // ───────────────────────────────────────────────────────────────────────
 
 namespace {
-std::string build_ask_reply_bytes(const std::string& action, const std::string& payload) {
-    flatbuffers::FlatBufferBuilder b(128);
-    const auto a = b.CreateString(action);
-    const auto p = b.CreateString(payload);
-    const auto off = CreateAskReply(b, a, p);
-    FinishAskReplyBuffer(b, off);
-    return std::string(reinterpret_cast<const char*>(b.GetBufferPointer()), b.GetSize());
-}
-
-std::string build_response_bytes(uint64_t request_id, Status status, const std::string& message) {
-    flatbuffers::FlatBufferBuilder b(128);
-    const auto m = b.CreateString(message);
-    const auto off = CreateResponse(b, request_id, status, m);
-    b.Finish(off);
-    return std::string(reinterpret_cast<const char*>(b.GetBufferPointer()), b.GetSize());
-}
-
 Status status_from_string(const std::string& s) {
     if (s == "ok") return Status_OK;
     if (s == "unknown" || s == "unknown_command") return Status_UNKNOWN_COMMAND;
@@ -682,7 +708,16 @@ std::map<std::string, std::string> table_to_map(lua_State* L, int idx) {
             if (lua_type(L, -1) == LUA_TSTRING) {
                 size_t vl = 0; const char* vs = lua_tolstring(L, -1, &vl); v.assign(vs, vl);
             } else if (lua_isnumber(L, -1)) {
-                v = std::to_string(lua_tonumber(L, -1));
+                // Integers must not serialize as "16000.000000".
+                const double d = lua_tonumber(L, -1);
+                double ip = 0;
+                if (std::modf(d, &ip) == 0.0 && std::fabs(d) < 1e15) {
+                    v = std::to_string(static_cast<long long>(ip));
+                } else {
+                    char buf[32];
+                    std::snprintf(buf, sizeof(buf), "%.17g", d);
+                    v = buf;
+                }
             } else if (lua_isboolean(L, -1)) {
                 v = lua_toboolean(L, -1) ? "true" : "false";
             }
@@ -763,53 +798,58 @@ static bool build_spawn_argv(lua_State* L, const LuaRuntime::BinaryEntry& entry,
             size_t len = 0; const char* s = lua_tolstring(L, i, &len); argv.emplace_back(s, len);
         } else if (lua_isnumber(L, i)) {
             argv.push_back(std::to_string(lua_tonumber(L, i)));
+        } else {
+            // Fail loudly rather than silently dropping an argument: a table or
+            // boolean here is a script bug (e.g. forgetting table.unpack).
+            err = "binary '" + name + "' argument " + std::to_string(i - 1) +
+                  " must be a string or number";
+            return false;
         }
     }
     return true;
 }
 
+// rana.spawn(name, ...) → a normalized result table. It ALWAYS returns a table
+// (never nil), so a caller can index it safely:
+//   { ok = bool, code = int, out = stdout, err = stderr, reason = string|nil }
+// `reason` is one of "not_allowed" | "bad_args" | "spawn_failed" | "timeout" |
+// "exit" (nil on success). `err` carries a human string in every failure case.
 int rana_spawn(lua_State* L) {
     LuaRuntime* rt = rt_from_up(L);
     const char* name = luaL_checkstring(L, 1);
+
+    auto push_result = [&](bool ok, int code, const std::string& out,
+                           const std::string& err, const char* reason) -> int {
+        lua_newtable(L);
+        lua_pushboolean(L, ok);   lua_setfield(L, -2, "ok");
+        lua_pushinteger(L, code); lua_setfield(L, -2, "code");
+        lua_pushlstring(L, out.data(), out.size()); lua_setfield(L, -2, "out");
+        lua_pushlstring(L, err.data(), err.size()); lua_setfield(L, -2, "err");
+        if (reason) { lua_pushstring(L, reason); lua_setfield(L, -2, "reason"); }
+        return 1;
+    };
+
     auto it = rt->binaries().find(name);
     if (it == rt->binaries().end()) {
-        lua_pushnil(L);
-        lua_pushstring(L, "binary not in allowlist");
-        return 2;
+        return push_result(false, -1, "", "binary not in allowlist", "not_allowed");
     }
     std::vector<std::string> argv;
     std::string err;
     if (!build_spawn_argv(L, it->second, name, argv, err)) {
-        lua_pushnil(L);
-        lua_pushstring(L, err.c_str());
-        return 2;
+        return push_result(false, -1, "", err, "bad_args");
     }
     SpawnResult sr = spawn_process("", argv, {}, rt->current_timeout(), /*capture_stdout=*/true);
-    lua_newtable(L);
-    lua_pushinteger(L, sr.exit_code); lua_setfield(L, -2, "exit_code");
-    lua_pushstring(L, sr.stdout_text.c_str()); lua_setfield(L, -2, "stdout");
-    lua_pushstring(L, sr.stderr_text.c_str()); lua_setfield(L, -2, "stderr");
-    lua_pushboolean(L, sr.timed_out); lua_setfield(L, -2, "timed_out");
-    lua_pushboolean(L, sr.spawn_failed); lua_setfield(L, -2, "spawn_failed");
-    return 1;
-}
-
-int rana_spawn_capture(lua_State* L) {
-    // Same as rana_spawn but returns the captured stdout string directly.
-    LuaRuntime* rt = rt_from_up(L);
-    const char* name = luaL_checkstring(L, 1);
-    auto it = rt->binaries().find(name);
-    if (it == rt->binaries().end()) {
-        lua_pushnil(L); lua_pushstring(L, "binary not in allowlist"); return 2;
+    if (sr.spawn_failed) {
+        return push_result(false, -1, sr.stdout_text,
+                           sr.stderr_text.empty() ? "spawn failed" : sr.stderr_text, "spawn_failed");
     }
-    std::vector<std::string> argv;
-    std::string err;
-    if (!build_spawn_argv(L, it->second, name, argv, err)) {
-        lua_pushnil(L); lua_pushstring(L, err.c_str()); return 2;
+    if (sr.timed_out) {
+        return push_result(false, -1, sr.stdout_text, "command timed out", "timeout");
     }
-    SpawnResult sr = spawn_process("", argv, {}, rt->current_timeout(), true);
-    lua_pushstring(L, sr.stdout_text.c_str());
-    return 1;
+    if (sr.exit_code != 0) {
+        return push_result(false, sr.exit_code, sr.stdout_text, sr.stderr_text, "exit");
+    }
+    return push_result(true, 0, sr.stdout_text, sr.stderr_text, nullptr);
 }
 
 int rana_http_post(lua_State* L) {
@@ -823,32 +863,8 @@ int rana_http_post(lua_State* L) {
         size_t blen = 0; const char* b = luaL_checklstring(L, 2, &blen); body_s.assign(b, blen);
     }
     std::map<std::string, std::string> headers = table_to_map(L, 3);
-    auto [status, resp] = http_do("POST", url, headers, body_s, rt->endpoints());
-    lua_pushboolean(L, status >= 200 && status < 300);
-    lua_pushlstring(L, resp.data(), resp.size());
-    return 2;
-}
-
-int rana_post_multipart(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    const char* url = luaL_checkstring(L, 1);
-    const char* field = luaL_checkstring(L, 2);
-    const char* filename = luaL_optstring(L, 3, "file");
-    const char* ctype = luaL_optstring(L, 4, "application/octet-stream");
-    size_t dlen = 0; const char* data = luaL_checklstring(L, 5, &dlen);
-    std::map<std::string, std::string> headers = table_to_map(L, 6);
-
-    const std::string boundary = "----ranaPlutoBoundary7Q4k9";
-    std::string body =
-        "--" + boundary + "\r\n" +
-        "Content-Disposition: form-data; name=\"" + field + "\"; filename=\"" +
-        filename + "\"\r\n" +
-        "Content-Type: " + ctype + "\r\n\r\n";
-    body.append(data, dlen);
-    body += "\r\n--" + boundary + "--\r\n";
-
-    headers["Content-Type"] = "multipart/form-data; boundary=" + boundary;
-    auto [status, resp] = http_do("POST", url, headers, body, rt->endpoints());
+    auto [status, resp] = http_do("POST", url, headers, body_s, rt->endpoints(),
+                                  rt->current_etl_timeout());
     lua_pushboolean(L, status >= 200 && status < 300);
     lua_pushlstring(L, resp.data(), resp.size());
     return 2;
@@ -861,26 +877,10 @@ int rana_decode_json(lua_State* L) {
     return 1;
 }
 
-int rana_encode_json(lua_State* L) {
-    std::string out;
-    json::encode(L, 1, out);
-    lua_pushlstring(L, out.data(), out.size());
-    return 1;
-}
-
 int rana_get_system_prompt(lua_State* L) {
     LuaRuntime* rt = rt_from_up(L);
     const std::string p = rt->get_system_prompt();
     lua_pushlstring(L, p.data(), p.size());
-    return 1;
-}
-
-int rana_build_ask_reply(lua_State* L) {
-    const char* action = luaL_checkstring(L, 1);
-    std::string payload;
-    if (!lua_isnoneornil(L, 2)) payload = luaL_checkstring(L, 2);
-    const std::string bytes = build_ask_reply_bytes(action, payload);
-    lua_pushlstring(L, bytes.data(), bytes.size());
     return 1;
 }
 
@@ -989,43 +989,6 @@ int rana_respond(lua_State* L) {
     return 0;
 }
 
-int rana_fetch_command(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    lua_newtable(L);
-    lua_pushstring(L, rt->current_key().c_str()); lua_setfield(L, -2, "key");
-    lua_pushstring(L, rt->current_action().c_str()); lua_setfield(L, -2, "action");
-    lua_pushstring(L, rt->current_target().c_str()); lua_setfield(L, -2, "target");
-    lua_newtable(L);
-    for (const auto& [k, v] : rt->current_params()) {
-        lua_pushstring(L, v.c_str()); lua_setfield(L, -2, k.c_str());
-    }
-    lua_setfield(L, -2, "params");
-    const std::string& d = rt->current_data_str();
-    lua_pushlstring(L, d.data(), d.size()); lua_setfield(L, -2, "data");
-    return 1;
-}
-
-int rana_build_response(lua_State* L) {
-    uint64_t request_id = static_cast<uint64_t>(luaL_checkinteger(L, 1));
-    const char* status = luaL_checkstring(L, 2);
-    std::string message = lua_isnoneornil(L, 3) ? "" : luaL_checkstring(L, 3);
-    const std::string bytes = build_response_bytes(request_id, status_from_string(status), message);
-    lua_pushlstring(L, bytes.data(), bytes.size());
-    return 1;
-}
-
-int rana_get_config_path(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    lua_pushstring(L, rt->config()->path.c_str());
-    return 1;
-}
-
-int rana_get_socket_path(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    lua_pushstring(L, rt->config()->daemon.socket_path.c_str());
-    return 1;
-}
-
 int rana_get_llm_url(lua_State* L) {
     LuaRuntime* rt = rt_from_up(L);
     lua_pushstring(L, rt->config()->llm.url.c_str());
@@ -1047,12 +1010,6 @@ int rana_get_stt_url(lua_State* L) {
 int rana_get_stt_model(lua_State* L) {
     LuaRuntime* rt = rt_from_up(L);
     lua_pushstring(L, rt->config()->stt.model.c_str());
-    return 1;
-}
-
-int rana_get_workdir(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    lua_pushstring(L, rt->config()->workdir.c_str());
     return 1;
 }
 
@@ -1096,44 +1053,6 @@ int rana_allow_endpoints(lua_State* L) {
     return 0;
 }
 
-int rana_set_constants(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    rt->set_constants(table_to_map(L, 1));
-    return 0;
-}
-
-int rana_set_fs_whitelist(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    rt->set_fs_whitelist(table_to_strvec(L, 1));
-    return 0;
-}
-
-int rana_register_script_meta(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    const char* key = luaL_checkstring(L, 1);
-    std::string name, description, examples_json;
-    std::vector<std::string> actions, keywords;
-    std::map<std::string, std::string> params;
-    std::set<ScriptFlag> flags;
-    bool danger = false;
-    uint32_t timeout_ms = 5000;
-    if (lua_istable(L, 2)) {
-        lua_getfield(L, 2, "name"); if (lua_type(L, -1) == LUA_TSTRING) name = lua_tostring(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 2, "description"); if (lua_type(L, -1) == LUA_TSTRING) description = lua_tostring(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 2, "timeout_ms"); timeout_ms = static_cast<uint32_t>(lua_tointeger(L, -1)); lua_pop(L, 1);
-        lua_getfield(L, 2, "actions"); actions = table_to_strvec(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 2, "keywords"); keywords = table_to_strvec(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 2, "params"); params = table_to_map(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 2, "danger"); danger = lua_toboolean(L, -1); lua_pop(L, 1);
-        // examples: serialize back to JSON via our encoder for the prompt.
-        lua_getfield(L, 2, "examples");
-        std::string ej; json::encode(L, -1, ej); examples_json = ej; lua_pop(L, 1);
-        lua_getfield(L, 2, "flags"); flags = table_to_flags(L, -1); lua_pop(L, 1);
-    }
-    rt->register_script_meta(key, name, description, actions, keywords, params, timeout_ms, examples_json, danger, flags);
-    return 0;
-}
-
 // rana.script_metas() → { [key] = { description, keywords = {...}, danger = bool } }
 // Exposes the startup-scanned metas to the ask hop's fuzzy pre-router so a
 // transcript can be routed to a script WITHOUT the LLM round-trip.
@@ -1160,18 +1079,6 @@ int rana_log(lua_State* L) {
     return 0;
 }
 
-int rana_base64_encode(lua_State* L) {
-    size_t len = 0; const char* s = luaL_checklstring(L, 1, &len);
-    lua_pushstring(L, base64_encode(std::vector<uint8_t>(s, s + len)).c_str());
-    return 1;
-}
-
-int rana_base64_decode(lua_State* L) {
-    size_t len = 0; const char* s = luaL_checklstring(L, 1, &len);
-    lua_pushlstring(L, base64_decode(std::string(s, len)).data(), base64_decode(std::string(s, len)).size());
-    return 1;
-}
-
 // Convert raw on-the-wire audio into WAV bytes for the STT hop. `encoding` is
 // "pcm16" or "wav"; sample_rate/channels apply to pcm16. Exposes audio.cpp's
 // decode_to_wav to Pluto so the talk hop (scripts/talk.pluto) can be a rewriteable
@@ -1191,35 +1098,85 @@ int rana_audio_decode_to_wav(lua_State* L) {
     return 1;
 }
 
+// Each dot-separated segment of a module name must be [A-Za-z0-9_]+ so a name can
+// never contain path separators or traversal.
+bool valid_module_name(const std::string& s) {
+    if (s.empty()) return false;
+    size_t start = 0;
+    for (;;) {
+        const size_t dot = s.find('.', start);
+        const size_t end = (dot == std::string::npos) ? s.size() : dot;
+        if (end == start) return false;  // empty segment ("a..b", leading/trailing dot)
+        for (size_t i = start; i < end; ++i) {
+            const char c = s[i];
+            if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) return false;
+        }
+        if (dot == std::string::npos) break;
+        start = dot + 1;
+    }
+    return true;
+}
+
+// The ONLY loader installed in a script state: it resolves require("lib.<name>")
+// to a reviewed file under <scripts_dir>/lib/<name>.lua and refuses everything
+// else (both other namespaces and any traversal). This lets shared Lua helpers be
+// factored out idiomatically without reopening package.path/searchers.
+int rana_lib_searcher(lua_State* L) {
+    LuaRuntime* rt = static_cast<LuaRuntime*>(lua_touserdata(L, lua_upvalueindex(1)));
+    const char* name = luaL_checkstring(L, 1);
+    const std::string mod(name);
+    if (mod.compare(0, 4, "lib.") != 0 || !valid_module_name(mod)) {
+        lua_pushfstring(L, "module '%s' is not available", name);
+        return 1;  // string => "not found", require tries the next searcher
+    }
+    std::string rel = mod;
+    for (char& c : rel) if (c == '.') c = '/';
+    const std::string path = rt->scripts_dir() + "/" + rel + ".lua";
+    if (::access(path.c_str(), R_OK) != 0) {
+        lua_pushfstring(L, "module '%s' not found", name);
+        return 1;
+    }
+    if (luaL_loadfile(L, path.c_str()) != LUA_OK) {
+        return 1;  // leave the loader's error message as the searcher result
+    }
+    lua_pushstring(L, path.c_str());
+    return 2;  // loader + path
+}
+
+// Wrap a bridge function so a C++ exception can never unwind across the Lua C
+// boundary (which would std::terminate the daemon). On any exception, surface a
+// (nil, message) pair; Lua callers are expected to handle it.
+template <int (*F)(lua_State*)>
+int rana_guard(lua_State* L) {
+    try {
+        return F(L);
+    } catch (const std::exception& e) {
+        lua_pushnil(L);
+        lua_pushstring(L, e.what());
+        return 2;
+    } catch (...) {
+        lua_pushnil(L);
+        lua_pushstring(L, "internal error");
+        return 2;
+    }
+}
+
 const luaL_Reg kRanaLib[] = {
-    {"spawn", rana_spawn},
-    {"http_post", rana_http_post},
-    {"http_post_multipart", rana_post_multipart},
-    {"json_encode", rana_encode_json},
-    {"json_decode", rana_decode_json},
-    {"get_system_prompt", rana_get_system_prompt},
-    {"build_ask_reply", rana_build_ask_reply},
-    {"build_response", rana_build_response},
-    {"dispatch", rana_dispatch},
-    {"has_script", rana_has_script},
-    {"script_metas", rana_script_metas},
-    {"respond", rana_respond},
-    {"fetch_command", rana_fetch_command},
-    {"get_config_path", rana_get_config_path},
-    {"get_socket_path", rana_get_socket_path},
-    {"get_llm_url", rana_get_llm_url},
-    {"get_llm_model", rana_get_llm_model},
-    {"get_stt_url", rana_get_stt_url},
-    {"get_stt_model", rana_get_stt_model},
-    {"get_workdir", rana_get_workdir},
-    {"allow_binaries", rana_allow_binaries},
-    {"allow_endpoints", rana_allow_endpoints},
-    {"register_script_meta", rana_register_script_meta},
-    {"set_constants", rana_set_constants},
-    {"set_fs_whitelist", rana_set_fs_whitelist},
-    {"log", rana_log},
-    {"base64_encode", rana_base64_encode},
-    {"base64_decode", rana_base64_decode},
+    {"spawn", rana_guard<rana_spawn>},
+    {"http_post", rana_guard<rana_http_post>},
+    {"json_decode", rana_guard<rana_decode_json>},
+    {"get_system_prompt", rana_guard<rana_get_system_prompt>},
+    {"dispatch", rana_guard<rana_dispatch>},
+    {"has_script", rana_guard<rana_has_script>},
+    {"script_metas", rana_guard<rana_script_metas>},
+    {"respond", rana_guard<rana_respond>},
+    {"get_llm_url", rana_guard<rana_get_llm_url>},
+    {"get_llm_model", rana_guard<rana_get_llm_model>},
+    {"get_stt_url", rana_guard<rana_get_stt_url>},
+    {"get_stt_model", rana_guard<rana_get_stt_model>},
+    {"allow_binaries", rana_guard<rana_allow_binaries>},
+    {"allow_endpoints", rana_guard<rana_allow_endpoints>},
+    {"log", rana_guard<rana_log>},
     {nullptr, nullptr},
 };
 
@@ -1227,7 +1184,7 @@ const luaL_Reg kRanaLib[] = {
 // namespace so it reads as a distinct capability. Same lightuserdata upvalue
 // convention as kRanaLib (rt_from_up reads upvalue 1).
 const luaL_Reg kRanaAudioLib[] = {
-    {"decode_to_wav", rana_audio_decode_to_wav},
+    {"decode_to_wav", rana_guard<rana_audio_decode_to_wav>},
     {nullptr, nullptr},
 };
 
@@ -1286,7 +1243,7 @@ lua_State* LuaRuntime::new_state() {
     L->l_G->deadline =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count()
-        + static_cast<std::time_t>(current_timeout_) * 1000000LL;
+        + static_cast<std::time_t>(current_etl_timeout_) * 1000000LL;
 #endif
 
     // Hardening (always on, no config toggle): only open the libraries our
@@ -1312,13 +1269,23 @@ lua_State* LuaRuntime::new_state() {
     }
 
     // Make `require` fail closed: no disk/cpath, no dynamic loader, empty
-    // preload + searcher tables so nothing (incl. ffi/socket/http) resolves.
+    // preload table, and a searcher list containing ONLY our restricted lib/
+    // loader — so nothing (incl. ffi/socket/http) resolves.
     if (lua_getglobal(L, "package") == LUA_TTABLE) {
         lua_pushstring(L, ""); lua_setfield(L, -2, "path");
         lua_pushstring(L, ""); lua_setfield(L, -2, "cpath");
         lua_pushnil(L); lua_setfield(L, -2, "loadlib");
         lua_pushstring(L, "preload");  lua_newtable(L); lua_settable(L, -3);
-        lua_pushstring(L, "searchers"); lua_newtable(L); lua_settable(L, -3);
+        // searchers: exactly ONE loader — the restricted lib/ searcher. Pluto's
+        // built-in Lua/C/preload searchers are all absent, so require() of
+        // ffi/socket/os/... cannot resolve, while the reviewed scripts/lib/*
+        // helpers stay reachable as require("lib.<name>").
+        lua_pushstring(L, "searchers");
+        lua_newtable(L);
+        lua_pushlightuserdata(L, this);
+        lua_pushcclosure(L, rana_lib_searcher, 1);
+        lua_rawseti(L, -2, 1);
+        lua_settable(L, -3);
         lua_pushstring(L, "loaders");  lua_newtable(L); lua_settable(L, -3);
         lua_pop(L, 1);
     }
@@ -1350,8 +1317,6 @@ void LuaRuntime::allow_endpoints(
     const std::vector<std::tuple<std::string, std::string, int>>& v) {
     for (const auto& [s, h, p] : v) endpoints_.push_back({s, h, p});
 }
-void LuaRuntime::set_fs_whitelist(const std::vector<std::string>& v) { fs_whitelist_ = v; }
-void LuaRuntime::set_constants(const std::map<std::string, std::string>& m) { constants_ = m; }
 
 void LuaRuntime::register_script_meta(const std::string& key, const std::string& name,
                                      const std::string& description,
@@ -1497,15 +1462,12 @@ RanaResult LuaRuntime::run_entrypoint(const std::string& key,
     RanaResult out;
     const std::string path = scripts_dir_ + "/" + key + ".pluto";
 
-    current_key_ = key;
-    current_action_ = action;
-    current_target_ = target;
     if (params) current_params_ = *params; else current_params_.clear();
-    if (data) current_data_ = *data; else current_data_.clear();
     auto mit = metas_.find(key);
     current_timeout_ = (mit != metas_.end()) ? mit->second.timeout_ms : 5000;
+    current_etl_timeout_ = current_timeout_;
     if (mit != metas_.end() && mit->second.flags.count(ScriptFlag::LongIdle) > 0) {
-        current_timeout_ += kLongIdleGrantMs;
+        current_etl_timeout_ += kLongIdleGrantMs;
     }
 
     lua_State* L = new_state();
@@ -1669,12 +1631,6 @@ void LuaRuntime::request_respond(const std::string& key, const std::string& acti
 const std::map<std::string, LuaRuntime::BinaryEntry>& LuaRuntime::binaries() const { return binaries_; }
 const std::vector<LuaRuntime::Endpoint>& LuaRuntime::endpoints() const { return endpoints_; }
 uint32_t LuaRuntime::current_timeout() const { return current_timeout_; }
-const std::string& LuaRuntime::current_key() const { return current_key_; }
-const std::string& LuaRuntime::current_action() const { return current_action_; }
-const std::string& LuaRuntime::current_target() const { return current_target_; }
-const std::map<std::string, std::string>& LuaRuntime::current_params() const { return current_params_; }
-std::string LuaRuntime::current_data_str() const {
-    return std::string(reinterpret_cast<const char*>(current_data_.data()), current_data_.size());
-}
+uint32_t LuaRuntime::current_etl_timeout() const { return current_etl_timeout_; }
 
 }  // namespace rana

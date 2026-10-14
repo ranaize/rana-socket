@@ -5,10 +5,16 @@ key it sends. Every command maps onto the generic envelope Command{key, action,
 target, params, data} (see schema/command.fbs); the daemon validates `key`
 against [commands.allowed] and routes to scripts/<key>.pluto.
 
-The generated FlatBuffers module (`command_generated.py`) ships inside this
-package and is produced by:
+The generated FlatBuffers module (`command_generated.py`) is **not** tracked in
+git. It is produced into this package by the build (premake `gen_schema_daemon`
+copies it in from `schema/generated`), or standalone via:
 
-    flatc --gen-onefile --python -o schema/generated schema/command.fbs
+    ./client/py/gen_command_generated.sh
+
+Run that once after cloning — before `pip install` — and again whenever
+`schema/command.fbs` changes. Keep flatc in lockstep with the `flatbuffers==`
+pin in `pyproject.toml`: the Python runtime API is version-locked to the
+generator.
 """
 
 import base64
@@ -153,9 +159,9 @@ class CommandBuilder:
     def talk(audio: bytes, encoding: str = "pcm16", sample_rate: int = 16000,
              channels: int = 1, request_id: int = 0) -> bytes:
         """Build a `talk` Command: raw audio bytes + format metadata. The daemon
-        decodes/transcribes on-server (rana-serializer + STT hop), then routes the
-        transcript through the ask hop — exactly as `ask()` does with text. The
-        (untrusted) client never sees the LLM or STT."""
+        decodes/transcribes on-server (Pluto STT hop), then routes the transcript
+        through the ask hop — exactly as `ask()` does with text. The (untrusted)
+        client never sees the LLM or STT."""
         b = flatbuffers.Builder(1024)
         params = [
             ("encoding", encoding),

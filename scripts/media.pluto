@@ -1,7 +1,9 @@
 -- scripts/media.pluto
 -- key = "media". Media player control via the deployment's `media` backend.
 
-local rana = require("rana")
+local exec = require("lib.exec")
+local result = require("lib.result")
+local verbs = require("lib.verbs")
 
 local M = {}
 
@@ -24,12 +26,12 @@ function M.execute(cmd)
     local action = cmd.action
     local target = cmd.target or ""
     if not action or action == "" then
-        local t = (target or ""):lower()
-        if t:match("pause") then action = "pause"
-        elseif t:match("stop") then action = "stop"
-        elseif t:match("next") then action = "next"
-        elseif t:match("previous") or t:match("prev") then action = "prev"
-        else action = "play" end
+        action = verbs.infer(target, {
+            { verb = "pause", patterns = { "pause" } },
+            { verb = "stop",  patterns = { "stop" } },
+            { verb = "next",  patterns = { "next" } },
+            { verb = "prev",  patterns = { "previous", "prev" } },
+        }, "play")
         target = ""
     end
     local args = { action }
@@ -37,15 +39,12 @@ function M.execute(cmd)
         table.insert(args, target)
     end
 
-    local result = rana.spawn("media", table.unpack(args))
-    if result.timed_out then
-        return { status = "error", message = "command timed out" }
-    end
-    if result.exit_code ~= 0 then
-        return { status = "error", message = "media failed: " .. result.stderr }
+    local ok, res = exec.run("media", table.unpack(args))
+    if not ok then
+        return result.error(res)
     end
 
-    return { status = "ok", message = "media " .. action }
+    return result.ok("media " .. action)
 end
 
 return M

@@ -9,7 +9,7 @@
 #   - [commands.allowed] is the registry. A key is addressable ONLY if it is
 #     listed here AND a matching scripts/<key>.pluto exists (cross-checked by the
 #     daemon at startup). Per-command tuning (description/keywords/timeout) lives
-#     in the script's own meta table (scripts/init.lua), not here.
+#     in the script's own meta table, not here.
 
 [daemon]
 socket_type = "unix"

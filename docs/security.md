@@ -53,31 +53,42 @@ luaL_openselectedlibs(L, kRanaLoadLibs, 0);
 After opening, the sandbox additionally:
 - Strips globals: `io`, `os`, `debug`, `load`, `loadfile`, `dofile`, `ffi`,
   `socket`, `http`, `tls`, `crypto`, `wasm`.
-- Empties `package.path`/`package.cpath`, nils `package.loadlib`, and replaces
-  `package.preload`, `package.searchers`, `package.loaders` with **empty tables**
-  → `require` can resolve nothing.
+- Empties `package.path`/`package.cpath`, nils `package.loadlib`, empties
+  `package.preload`/`package.loaders`, and installs a **single restricted
+  searcher** that resolves only `require("lib.<name>")` →
+  `scripts_dir/lib/<name>.lua` (reviewed helpers; module names are `[A-Za-z0-9_]`
+  segments, so no separators/traversal). Everything else — `ffi`, `socket`,
+  `http`, `os`, ... — resolves to nothing.
 - Purges `package.loaded` for all the above so a library cannot be resurrected.
 
 ### 3. Bridge allowlists (the only sanctioned escape hatches)
 All privileged actions go through the `rana.*` C bridge and are gated:
-- `rana.command(...)` / `rana.http_post(...)` — only commands/endpoints present
-  in the `[commands.allowed]` registry and the configured endpoint allowlist.
-- `rana.text_to_speech`, `rana.audio_*`, `rana.ask`, `rana.stt`, etc. — each
-  backed by an allowlist or explicit out-of-band user confirmation.
-- `rana.http_post` uses our own `http_do` (getaddrinfo + TLS) and only talks to
-  allowlisted hosts; it is **not** Pluto's `http` library.
+- `rana.spawn(...)` — only binaries present in the `init.lua` allowlist.
+- `rana.dispatch(...)` / `rana.respond(...)` — only `[commands.allowed]` keys.
+- `rana.http_post(...)` — only hosts present in the endpoint allowlist.
+- `rana.audio.decode_to_wav(...)` — in-process codec; no shell, no network.
+- `rana.http_post` uses our own `http_do` (getaddrinfo + plaintext HTTP/1.1 with
+  send/recv deadlines) and only talks to allowlisted hosts; it is **not** Pluto's
+  `http` library. **TLS is not implemented**: `https` URLs are rejected at the
+  scheme check rather than silently connecting in the clear — terminate TLS in a
+  local proxy if you need it.
 
 ### 4. Script registration
-- `init.lua` registers each script's `meta` (name, description, actions,
-  params, timeout, examples). Scripts are self-describing and must declare what
-  they do.
-- A per-script filesystem whitelist and execution timeout bound blast radius.
+- The daemon scans `scripts/*.pluto` at startup and reads each script's `meta`
+  (name, description, actions, params, timeout, examples, flags). Scripts are
+  self-describing and must declare what they do; `init.lua` only registers the
+  binary/endpoint allowlists.
+- A per-script execution timeout bounds blast radius. Scripts cannot touch the
+  filesystem directly (`io`/`os` are stripped); the only file access is the
+  host-side `lib/` searcher, which reads the reviewed `scripts/lib/*.lua` only.
 
-## Dynamic-script hops
-`ask.pluto` and `lookup_machine.pluto`/`stt.pluto` generate further scripts
-in-process. Those generated scripts run in the **same locked-down state** — the
-runtime does not grant them extra privileges. `ask`/`stt` require explicit
-user confirmation before any side effect.
+## In-process hops
+`talk.pluto` reaches `stt.pluto` and `ask.pluto` through the generic
+`rana.dispatch` hop; `ask.pluto` builds its intent from `lib/llm.lua` +
+`lib/fuzzy.lua`. Hops run in the **same locked-down state** — the runtime does
+not grant them extra privileges. The one confirmation gate is `power.pluto`:
+a destructive power action requires the client's explicit `params.confirm` and
+otherwise fails closed (`SAFETY_GATE_FAILED`).
 
 ## Operational rules
 - **Never** switch `new_state()` back to `luaL_openlibs`. That silently re-opens

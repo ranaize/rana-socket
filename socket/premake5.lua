@@ -19,7 +19,6 @@ files({
 	ROOT .. "/socket/src/**.h",
 	ROOT .. "/socket/src/**.cpp",
 	gen_dir .. "/command_generated.h",
-	gen_dir .. "/ask_reply_generated.h",
 })
 
 includedirs({

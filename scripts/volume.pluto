@@ -3,7 +3,9 @@
 -- metadata (enforced in C), then shells out to `espeak` to "speak" the result
 -- (placeholder for a real volume backend; geometry unchanged).
 
-local rana = require("rana")
+local exec = require("lib.exec")
+local result = require("lib.result")
+local verbs = require("lib.verbs")
 
 local M = {}
 
@@ -29,22 +31,20 @@ function M.execute(cmd)
     local action = cmd.action
     local arg = cmd.target or ""
     if not action or action == "" then
-        local t = (arg or ""):lower()
-        local lvl = string.match(t, "%d+")
-        if t:match("mute") or t:match("muted") then
+        local lvl = verbs.first_number(arg)
+        if verbs.fold(arg):match("mute") then
             action, arg = "set", "0"
         elseif lvl then
             action, arg = "set", lvl
-        elseif t:match("up") or t:match("louder") or t:match("raise") then
-            action = "up"
-        elseif t:match("down") or t:match("quieter") or t:match("lower") then
-            action = "down"
         else
-            action = "get"
+            action = verbs.infer(arg, {
+                { verb = "up",   patterns = { "up", "louder", "raise" } },
+                { verb = "down", patterns = { "down", "quieter", "lower" } },
+            }, "get")
         end
     end
     if action ~= "set" and action ~= "get" and action ~= "up" and action ~= "down" then
-        return { status = "error", message = "unknown volume action: " .. tostring(action) }
+        return result.error("unknown volume action: " .. tostring(action))
     end
 
     if action == "set" then
@@ -53,16 +53,12 @@ function M.execute(cmd)
         arg = action
     end
 
-    -- rana.spawn returns { spawn_failed, timed_out, exit_code, stdout, stderr }.
-    local result = rana.spawn("espeak", "volume " .. arg)
-    if result.timed_out then
-        return { status = "error", message = "command timed out" }
-    end
-    if result.exit_code ~= 0 then
-        return { status = "error", message = "espeak failed: " .. result.stderr }
+    local ok, res = exec.run("espeak", "volume " .. arg)
+    if not ok then
+        return result.error(res)
     end
 
-    return { status = "ok", message = (result.stdout or ""):gsub("%s+$", "") }
+    return result.ok((res.out or ""):gsub("%s+$", ""))
 end
 
 return M

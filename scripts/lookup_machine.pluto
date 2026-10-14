@@ -2,7 +2,8 @@
 -- key = "lookup_machine". Resolve a hostname/role to a machine address via the
 -- deployment's `lookup` backend, then returns the answer as plain text.
 
-local rana = require("rana")
+local exec = require("lib.exec")
+local result = require("lib.result")
 
 local M = {}
 
@@ -21,18 +22,15 @@ M.meta = {
 function M.execute(cmd)
     local name = cmd.target or ""
     if name == "" then
-        return { status = "error", message = "missing name" }
+        return result.error("missing name")
     end
 
-    local result = rana.spawn("lookup", name)
-    if result.timed_out then
-        return { status = "error", message = "command timed out" }
-    end
-    if result.exit_code ~= 0 then
-        return { status = "error", message = "lookup failed: " .. result.stderr }
+    local ok, res = exec.run("lookup", name)
+    if not ok then
+        return result.error(res)
     end
 
-    return { status = "ok", message = (result.stdout or ""):gsub("%s+$", "") }
+    return result.ok((res.out or ""):gsub("%s+$", ""))
 end
 
 return M

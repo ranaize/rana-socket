@@ -2,7 +2,8 @@
 -- key = "speak". The text-to-speech sink used by the ask hop's "reply" action,
 -- and directly addressable as a command.
 
-local rana = require("rana")
+local exec = require("lib.exec")
+local result = require("lib.result")
 
 local M = {}
 
@@ -20,18 +21,15 @@ M.meta = {
 function M.execute(cmd)
     local text = cmd.target or ""
     if text == "" then
-        return { status = "error", message = "nothing to speak" }
+        return result.error("nothing to speak")
     end
 
-    local result = rana.spawn("espeak", text)
-    if result.timed_out then
-        return { status = "error", message = "command timed out" }
-    end
-    if result.exit_code ~= 0 then
-        return { status = "error", message = "espeak failed: " .. result.stderr }
+    local ok, res = exec.run("espeak", text)
+    if not ok then
+        return result.error(res)
     end
 
-    return { status = "ok", message = "spoke: " .. text }
+    return result.ok("spoke: " .. text)
 end
 
 return M
