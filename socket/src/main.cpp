@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Boot the Pluto runtime: run init.lua (binary/endpoint allowlists, constants,
+    // Boot the Pluto runtime: run init.pluto (binary/endpoint allowlists, constants,
     // fs whitelist) and scan scripts/ for *.pluto + their meta tables.
     rana::LuaRuntime rt;
     if (!rt.init(cfg, err)) {

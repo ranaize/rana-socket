@@ -1,6 +1,6 @@
 -- scripts/power.pluto
 -- key = "power". Host power management via the fixed-argv sudo entries
--- (shutdown/reboot/suspend in init.lua).
+-- (shutdown/reboot/suspend in init.pluto).
 
 local exec = require("lib.exec")
 local result = require("lib.result")
@@ -44,25 +44,25 @@ function M.execute(cmd)
             return result.error("unrecognized power request")
         end
     end
-    if action ~= "shutdown" and action ~= "reboot" and action ~= "suspend" then
-        return result.error("unknown power action: " .. tostring(action))
+    if not (action in { "shutdown", "reboot", "suspend" }) then
+        return result.error($"unknown power action: {action}")
     end
 
     -- Destructive: the client confirms out of band and sets params.confirm
     -- ("true"). An unconfirmed request (e.g. one routed by voice through ask)
     -- fails closed rather than shutting the machine down implicitly.
-    if not (cmd.params and cmd.params.confirm) then
-        return result.safety("power " .. action .. " requires confirmation")
+    if not cmd.params?.confirm then
+        return result.safety($"power {action} requires confirmation")
     end
 
-    -- Fixed argv-backed verbs (init.lua entries shutdown/reboot/suspend run sudo -n
+    -- Fixed argv-backed verbs (init.pluto entries shutdown/reboot/suspend run sudo -n
     -- with hardcoded arguments); we only pick the entry name, never args.
     local ok, res = exec.run(action)
     if not ok then
         return result.error(res)
     end
 
-    return result.ok("power " .. action)
+    return result.ok($"power {action}")
 end
 
 return M

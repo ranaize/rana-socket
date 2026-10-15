@@ -1,11 +1,11 @@
 -- scripts/ask.pluto
 -- In-process LLM hop. Replaces scripts/rana-ask.sh. Like every command, `ask` is
--- dispatched to M.execute here; the LLM call lives in lib/llm.lua, which
+-- dispatched to M.execute here; the LLM call lives in lib/llm.pluto, which
 -- talk.pluto reaches as a pipeline hop via
 -- rana.dispatch("ask", "ask", { target = transcript, internal = true }).
 --
 -- lib/llm.ask returns {action, payload}; lib/route turns that into one of:
---   * a FUZZY match   -> routed before the LLM is touched (see lib/fuzzy.lua),
+--   * a FUZZY match   -> routed before the LLM is touched (see lib/fuzzy.pluto),
 --                         so "open browser" goes straight to the client.
 --   * "reply"         -> rana.respond("speak", payload): TTS'd by the PEER.
 --   * a known [commands.allowed] -> rana.dispatch locally (power/mc_server/...).
@@ -14,8 +14,8 @@
 -- FLAG_LONG_IDLE grants extra wall-clock on top of timeout_ms (the LLM call is a
 -- slow, blocking upstream that would otherwise eat the whole Lua budget).
 -- ask does NOT gate egress itself: the outbound chain is gated by the build
--- (--tls), the config ([security].external_egress), and lib/llm.lua, while the
--- inbound side is gated in lib/route.lua — an answer from a "huggingface" entry
+-- (--tls), the config ([security].external_egress), and lib/llm.pluto, while the
+-- inbound side is gated in lib/route.pluto — an answer from a "huggingface" entry
 -- may only reach scripts that declare rana.flags.EXTERNAL_EGRESS.
 -- No subprocess, no shell, no curl on the host.
 
@@ -43,12 +43,12 @@ M.ask = llm.ask
 -- "false" to forbid the Hugging Face fallback for this one question; the call is
 -- otherwise gated by the build (--tls) and the [security] switch only.
 function M.execute(cmd)
-    local question = cmd.target or ""
-    if question == "" then question = cmd.data or "" end
+    local question = cmd.target ?? ""
+    if question == "" then question = cmd.data ?? "" end
     if question == "" then
         return result.invalid("no question")
     end
-    local allow_cloud = not (cmd.params and cmd.params.cloud == "false")
+    local allow_cloud = cmd.params?.cloud != "false"
     return route.route(llm.ask(question, { cloud = allow_cloud }))
 end
 

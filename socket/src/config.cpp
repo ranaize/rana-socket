@@ -151,10 +151,10 @@ std::string exe_dir() {
     return ".";
 }
 
-bool has_init_lua(const std::string& dir) {
+bool has_init_pluto(const std::string& dir) {
     if (dir.empty()) return false;
     struct stat st {};
-    return ::stat((dir + "/init.lua").c_str(), &st) == 0 && S_ISREG(st.st_mode);
+    return ::stat((dir + "/init.pluto").c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
 std::string dirname_of(const std::string& path) {
@@ -164,12 +164,12 @@ std::string dirname_of(const std::string& path) {
     return path.substr(0, pos);
 }
 
-// Walk up from `start` (a directory) looking for a `scripts/` dir with init.lua.
+// Walk up from `start` (a directory) looking for a `scripts/` dir with init.pluto.
 std::string find_scripts_upwards(const std::string& start) {
     std::string dir = start;
     for (;;) {
         const std::string cand = dir + "/scripts";
-        if (has_init_lua(cand)) return cand;
+        if (has_init_pluto(cand)) return cand;
         const std::string parent = dirname_of(dir);
         if (parent == dir) break;  // reached filesystem root
         dir = parent;
@@ -192,8 +192,8 @@ std::string resolve_scripts_dir(const Config& cfg) {
     }
     // 3) Autodiscover: walk up from the binary, then fixed install locations.
     if (auto f = find_scripts_upwards(exe_dir()); !f.empty()) return f;
-    if (has_init_lua("/opt/rana/scripts")) return "/opt/rana/scripts";
-    if (has_init_lua(cfg.workdir + "/scripts")) return cfg.workdir + "/scripts";
+    if (has_init_pluto("/opt/rana/scripts")) return "/opt/rana/scripts";
+    if (has_init_pluto(cfg.workdir + "/scripts")) return cfg.workdir + "/scripts";
     // Nothing found — return a best-guess path so the error names what we wanted.
     return cfg.workdir + "/scripts";
 }

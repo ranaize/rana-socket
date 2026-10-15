@@ -1,4 +1,4 @@
--- scripts/lib/result.lua
+-- scripts/lib/result.pluto
 --
 -- The single source of truth for what a script's execute() returns.
 --
@@ -16,9 +16,11 @@ M.FORBIDDEN = "forbidden"  -- policy refused the command
 M.INVALID   = "invalid"    -- malformed payload / params
 M.SAFETY    = "safety"     -- SAFETY_GATE_FAILED — a destructive op lacked confirmation
 
+-- Pluto: a lambda with a default argument. `message` defaults to "" when it is
+-- nil, exactly like the old `message or ""`, in one expression.
 local function make(status)
-    return function(message)
-        return { status = status, message = message or "" }
+    return |message = ""| -> do
+        return { status = status, message = message }
     end
 end
 

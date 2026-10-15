@@ -26,17 +26,17 @@ local DEFAULT_URL = "https://www.google.com"
 
 function M.execute(cmd)
     if cmd.action ~= "open" then
-        return result.error("unknown browser action: " .. tostring(cmd.action))
+        return result.error($"unknown browser action: {cmd.action}")
     end
-    local url = cmd.target or ""
-    if url == "" then url = DEFAULT_URL end
+    -- empty target -> the default start page; `??` handles the nil case.
+    local url = (cmd.target ?? "") == "" ? DEFAULT_URL : cmd.target
 
     local ok, res = exec.run("xdg_open", url)
     if not ok then
         return result.error(res)
     end
 
-    return result.ok("opened " .. url)
+    return result.ok($"opened {url}")
 end
 
 return M

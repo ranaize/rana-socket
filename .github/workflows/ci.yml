@@ -5,19 +5,31 @@ on:
   pull_request:
 
 jobs:
-  lua-checks:
-    name: Lua script checks
+  script-checks:
+    name: Pluto script checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Lua
-        run: sudo apt-get update && sudo apt-get install -y lua5.4
+      # The scripts use Pluto-only syntax (interpolation, `?.`, `??`, switch,
+      # `continue`, ...), so plain Lua can no longer parse them. Pin the exact
+      # interpreter the daemon's embedded runtime tracks (0.13.1).
+      - name: Install Pluto
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/pluto.zip \
+            https://github.com/PlutoLang/Pluto/releases/download/0.13.1/Linux.X64.zip
+          mkdir -p /tmp/pluto
+          unzip -q -o /tmp/pluto.zip -d /tmp/pluto
+          PLUTO_BIN="$(find /tmp/pluto -type f -name pluto | head -n1)"
+          test -n "$PLUTO_BIN"
+          install -m0755 "$PLUTO_BIN" /usr/local/bin/pluto
+          pluto --version || true
 
       # The daemon scans scripts/*.pluto at startup and hard-fails on a bad one,
-      # so load-check every script (and init.lua) before it can reach a release.
+      # so load-check every script (and init.pluto) before it can reach a release.
       - name: Load-check scripts
-        run: lua5.4 tests/check_scripts.lua
+        run: pluto tests/check_scripts.lua
 
       - name: Unit-test scripts/lib
-        run: lua5.4 tests/test_lib.lua
+        run: pluto tests/test_lib.lua

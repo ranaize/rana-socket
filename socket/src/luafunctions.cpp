@@ -6,6 +6,11 @@
 
 #include "audio.hpp"
 
+// The HTTP transport, JSON, base64 and process-spawn concerns live in their own
+// translation units; the bridge below only calls their public entry points.
+#include "http.h"
+#include "json.h"
+
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -23,15 +28,6 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#ifdef RANA_ENABLE_TLS
-// Provider-chain transport (TLS gated by the --tls premake flag). This is the
-// ONLY place TLS is spoken; generic rana.http_post remains http-only and can
-// never reach a huggingface provider (see rana_provider_post).
-#include <openssl/err.h>
-#include <openssl/ssl.h>
-#include <openssl/x509v3.h>
-#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -63,703 +59,6 @@
 #include "protocol.h"
 
 namespace rana {
-
-// ───────────────────────────────────────────────────────────────────────
-// Process spawning (moved here so rana.spawn can delegate to it)
-// ───────────────────────────────────────────────────────────────────────
-
-namespace {
-
-std::vector<std::string> merged_env(const std::vector<std::string>& extras) {
-    std::map<std::string, std::string> kv;
-    for (char** e = environ; e && *e; ++e) {
-        const std::string s(*e);
-        const auto eq = s.find('=');
-        if (eq == std::string::npos) continue;
-        kv.emplace(s.substr(0, eq), s.substr(eq + 1));
-    }
-    for (const auto& e : extras) {
-        const auto eq = e.find('=');
-        if (eq == std::string::npos) continue;
-        kv[e.substr(0, eq)] = e.substr(eq + 1);
-    }
-    std::vector<std::string> out;
-    out.reserve(kv.size());
-    for (const auto& [k, v] : kv) out.push_back(k + "=" + v);
-    return out;
-}
-
-}  // namespace
-
-SpawnResult spawn_process(const std::string& workdir,
-                         const std::vector<std::string>& argv,
-                         const std::vector<std::string>& extra_env,
-                         uint32_t timeout_ms,
-                         bool capture_stdout) {
-    SpawnResult res;
-    if (argv.empty()) { res.spawn_failed = true; return res; }
-
-    int err_pipe[2];
-    if (pipe(err_pipe) != 0) { res.spawn_failed = true; return res; }
-
-    int out_pipe[2] = {-1, -1};
-    if (capture_stdout) {
-        if (pipe(out_pipe) != 0) {
-            ::close(err_pipe[0]); ::close(err_pipe[1]);
-            res.spawn_failed = true; return res;
-        }
-    }
-
-    const std::vector<std::string> env_store = merged_env(extra_env);
-
-    std::vector<char*> c_argv;
-    c_argv.reserve(argv.size() + 1);
-    for (const auto& a : argv) c_argv.push_back(const_cast<char*>(a.c_str()));
-    c_argv.push_back(nullptr);
-
-    std::vector<char*> c_env;
-    c_env.reserve(env_store.size() + 1);
-    for (const auto& e : env_store) c_env.push_back(const_cast<char*>(e.c_str()));
-    c_env.push_back(nullptr);
-
-    const pid_t pid = fork();
-    if (pid < 0) {
-        ::close(err_pipe[0]); ::close(err_pipe[1]);
-        if (capture_stdout) { ::close(out_pipe[0]); ::close(out_pipe[1]); }
-        res.spawn_failed = true; return res;
-    }
-    if (pid == 0) {
-        ::close(err_pipe[0]);
-        ::dup2(err_pipe[1], STDERR_FILENO);
-        ::close(err_pipe[1]);
-        if (capture_stdout) {
-            ::close(out_pipe[0]);
-            ::dup2(out_pipe[1], STDOUT_FILENO);
-            ::close(out_pipe[1]);
-        }
-        if (!workdir.empty()) ::chdir(workdir.c_str());
-        ::execvpe(argv[0].c_str(), c_argv.data(), c_env.data());
-        ::_exit(127);
-    }
-
-    ::close(err_pipe[1]);
-    ::fcntl(err_pipe[0], F_SETFL, ::fcntl(err_pipe[0], F_GETFL) | O_NONBLOCK);
-    int out_fd = -1;
-    if (capture_stdout) {
-        ::close(out_pipe[1]);
-        out_fd = out_pipe[0];
-        ::fcntl(out_fd, F_SETFL, ::fcntl(out_fd, F_GETFL) | O_NONBLOCK);
-    }
-
-    auto drain = [&](int fd, std::string& dst) {
-        if (fd < 0) return;
-        char buf[4096];
-        for (;;) {
-            const ssize_t r = ::read(fd, buf, sizeof(buf));
-            if (r > 0) { dst.append(buf, static_cast<size_t>(r)); continue; }
-            break;
-        }
-    };
-
-    std::string err_out, out_out;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    int status = 0;
-    for (;;) {
-        drain(err_pipe[0], err_out);
-        if (capture_stdout) drain(out_fd, out_out);
-        const pid_t w = ::waitpid(pid, &status, WNOHANG);
-        if (w == pid) break;
-        if (w < 0) { if (errno == EINTR) continue; res.spawn_failed = true; break; }
-        if (std::chrono::steady_clock::now() > deadline) {
-            ::kill(pid, SIGKILL);
-            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-            res.timed_out = true; break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    drain(err_pipe[0], err_out);
-    if (capture_stdout) drain(out_fd, out_out);
-    ::close(err_pipe[0]);
-    if (capture_stdout) ::close(out_fd);
-
-    if (WIFEXITED(status)) res.exit_code = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status)) res.exit_code = 128 + WTERMSIG(status);
-
-    res.stderr_text = std::move(err_out);
-    if (res.stderr_text.size() > 4096) res.stderr_text.resize(4096);
-    if (capture_stdout) {
-        res.stdout_text = std::move(out_out);
-        if (res.stdout_text.size() > 16384) res.stdout_text.resize(16384);
-    }
-    return res;
-}
-
-// ───────────────────────────────────────────────────────────────────────
-// base64 (RFC4648)
-// ───────────────────────────────────────────────────────────────────────
-
-namespace {
-const char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-}  // namespace
-
-std::string base64_encode(const std::vector<uint8_t>& in) {
-    std::string out;
-    out.reserve(((in.size() + 2) / 3) * 4);
-    size_t i = 0;
-    while (i + 2 < in.size()) {
-        uint32_t n = (uint32_t(in[i]) << 16) | (uint32_t(in[i + 1]) << 8) | uint32_t(in[i + 2]);
-        out.push_back(kBase64[(n >> 18) & 63]);
-        out.push_back(kBase64[(n >> 12) & 63]);
-        out.push_back(kBase64[(n >> 6) & 63]);
-        out.push_back(kBase64[n & 63]);
-        i += 3;
-    }
-    size_t rem = in.size() - i;
-    if (rem == 1) {
-        uint32_t n = uint32_t(in[i]) << 16;
-        out.push_back(kBase64[(n >> 18) & 63]);
-        out.push_back(kBase64[(n >> 12) & 63]);
-        out.push_back('=');
-        out.push_back('=');
-    } else if (rem == 2) {
-        uint32_t n = (uint32_t(in[i]) << 16) | (uint32_t(in[i + 1]) << 8);
-        out.push_back(kBase64[(n >> 18) & 63]);
-        out.push_back(kBase64[(n >> 12) & 63]);
-        out.push_back(kBase64[(n >> 6) & 63]);
-        out.push_back('=');
-    }
-    return out;
-}
-
-std::string base64_decode(const std::string& in) {
-    auto val = [](char c) -> int {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '+') return 62;
-        if (c == '/') return 63;
-        return -1;
-    };
-    std::string out;
-    size_t i = 0;
-    while (i + 3 < in.size() + 1) {
-        int n = 0, cnt = 0;
-        for (int j = 0; j < 4 && i < in.size(); ++j, ++i) {
-            if (in[i] == '=') { n <<= 6; continue; }
-            const int v = val(in[i]);
-            if (v < 0) { n <<= 6; continue; }
-            n = (n << 6) | v; cnt++;
-        }
-        if (cnt == 0) break;
-        out.push_back(static_cast<char>((n >> 16) & 0xFF));
-        if (cnt >= 3) out.push_back(static_cast<char>((n >> 8) & 0xFF));
-        if (cnt >= 4) out.push_back(static_cast<char>(n & 0xFF));
-    }
-    return out;
-}
-
-// ───────────────────────────────────────────────────────────────────────
-// Minimal JSON (encode/parse) operating on the Lua stack.
-// ───────────────────────────────────────────────────────────────────────
-
-namespace json {
-
-static void encode(lua_State* L, int idx, std::string& out) {
-    idx = lua_absindex(L, idx);
-    const int t = lua_type(L, idx);
-    switch (t) {
-        case LUA_TNIL:
-            out += "null";
-            return;
-        case LUA_TBOOLEAN:
-            out += lua_toboolean(L, idx) ? "true" : "false";
-            return;
-        case LUA_TNUMBER: {
-            double d = lua_tonumber(L, idx);
-            double ip;
-            if (std::modf(d, &ip) == 0.0 && std::fabs(d) < 1e15) {
-                out += std::to_string(static_cast<long long>(ip));
-            } else {
-                char buf[32];
-                std::snprintf(buf, sizeof(buf), "%.17g", d);
-                out += buf;
-            }
-            return;
-        }
-        case LUA_TSTRING: {
-            size_t len = 0;
-            const char* s = lua_tolstring(L, idx, &len);
-            out += '"';
-            for (size_t i = 0; i < len; ++i) {
-                char c = s[i];
-                switch (c) {
-                    case '"': out += "\\\""; break;
-                    case '\\': out += "\\\\"; break;
-                    case '\b': out += "\\b"; break;
-                    case '\f': out += "\\f"; break;
-                    case '\n': out += "\\n"; break;
-                    case '\r': out += "\\r"; break;
-                    case '\t': out += "\\t"; break;
-                    default:
-                        if (static_cast<unsigned char>(c) < 0x20) {
-                            char buf[8];
-                            std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                            out += buf;
-                        } else {
-                            out += c;
-                        }
-                }
-            }
-            out += '"';
-            return;
-        }
-        case LUA_TTABLE: {
-            // Array if it is a dense 1..n sequence.
-            const int n = static_cast<int>(luaL_len(L, idx));
-            bool is_array = (n > 0);
-            if (is_array) {
-                for (int i = 1; i <= n; ++i) {
-                    lua_rawgeti(L, idx, i);
-                    if (lua_isnil(L, -1)) { is_array = false; lua_pop(L, 1); break; }
-                    lua_pop(L, 1);
-                }
-            }
-            if (is_array) {
-                out += '[';
-                for (int i = 1; i <= n; ++i) {
-                    if (i > 1) out += ',';
-                    lua_rawgeti(L, idx, i);
-                    encode(L, -1, out);
-                    lua_pop(L, 1);
-                }
-                out += ']';
-            } else {
-                out += '{';
-                bool first = true;
-                lua_pushnil(L);
-                while (lua_next(L, idx)) {
-                    if (lua_type(L, -2) != LUA_TSTRING) { lua_pop(L, 1); continue; }
-                    if (!first) out += ',';
-                    first = false;
-                    size_t klen = 0;
-                    const char* k = lua_tolstring(L, -2, &klen);
-                    out += '"';
-                    out.append(k, klen);
-                    out += "\":";
-                    encode(L, -1, out);
-                    lua_pop(L, 1);
-                }
-                out += '}';
-            }
-            return;
-        }
-        default:
-            out += "null";
-            return;
-    }
-}
-
-struct Parser {
-    const char* p;
-    const char* end;
-    lua_State* L;
-    void ws() { while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) ++p; }
-    void err(const std::string& m) { throw std::runtime_error("json: " + m); }
-    char peek() { if (p >= end) err("unexpected end"); return *p; }
-    char take() { if (p >= end) err("unexpected end"); return *p++; }
-    void expect(char c) { if (take() != c) err(std::string("expected '") + c + "'"); }
-
-    void parse_value() {
-        ws();
-        if (p >= end) err("unexpected end");
-        switch (peek()) {
-            case '{': return parse_object();
-            case '[': return parse_array();
-            case '"': return parse_string();
-            case 't': case 'f': return parse_bool();
-            case 'n': return parse_null();
-            default: return parse_number();
-        }
-    }
-
-    void parse_object() {
-        expect('{');
-        lua_newtable(L);
-        ws();
-        if (peek() == '}') { take(); return; }
-        while (true) {
-            ws();
-            if (peek() != '"') err("object key must be string");
-            parse_string();          // pushes key
-            ws(); expect(':'); ws();
-            parse_value();           // pushes value
-            lua_rawset(L, -3);
-            ws();
-            char c = take();
-            if (c == ',') continue;
-            if (c == '}') return;
-            err("expected ',' or '}'");
-        }
-    }
-
-    void parse_array() {
-        expect('[');
-        lua_newtable(L);
-        int i = 1;
-        ws();
-        if (peek() == ']') { take(); return; }
-        while (true) {
-            parse_value();
-            lua_rawseti(L, -2, i++);
-            ws();
-            char c = take();
-            if (c == ',') continue;
-            if (c == ']') return;
-            err("expected ',' or ']'");
-        }
-    }
-
-    void parse_string() {
-        expect('"');
-        std::string s;
-        while (p < end) {
-            char c = take();
-            if (c == '"') break;
-            if (c == '\\') {
-                char e = take();
-                switch (e) {
-                    case '"': s += '"'; break;
-                    case '\\': s += '\\'; break;
-                    case '/': s += '/'; break;
-                    case 'b': s += '\b'; break;
-                    case 'f': s += '\f'; break;
-                    case 'n': s += '\n'; break;
-                    case 'r': s += '\r'; break;
-                    case 't': s += '\t'; break;
-                    case 'u': {
-                        if (p + 4 > end) err("bad unicode escape");
-                        unsigned int cp = 0;
-                        for (int k = 0; k < 4; ++k) {
-                            char h = take();
-                            cp <<= 4;
-                            if (h >= '0' && h <= '9') cp |= (h - '0');
-                            else if (h >= 'a' && h <= 'f') cp |= (h - 'a' + 10);
-                            else if (h >= 'A' && h <= 'F') cp |= (h - 'A' + 10);
-                            else err("bad hex in unicode escape");
-                        }
-                        // Encode as UTF-8 (BMP only).
-                        if (cp < 0x80) s += static_cast<char>(cp);
-                        else if (cp < 0x800) {
-                            s += static_cast<char>(0xC0 | (cp >> 6));
-                            s += static_cast<char>(0x80 | (cp & 0x3F));
-                        } else {
-                            s += static_cast<char>(0xE0 | (cp >> 12));
-                            s += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                            s += static_cast<char>(0x80 | (cp & 0x3F));
-                        }
-                        break;
-                    }
-                    default: err("bad escape");
-                }
-            } else {
-                s += c;
-            }
-        }
-        lua_pushlstring(L, s.data(), s.size());
-    }
-
-    void parse_bool() {
-        if (end - p >= 4 && std::strncmp(p, "true", 4) == 0) { p += 4; lua_pushboolean(L, 1); return; }
-        if (end - p >= 5 && std::strncmp(p, "false", 5) == 0) { p += 5; lua_pushboolean(L, 0); return; }
-        err("bad literal");
-    }
-
-    void parse_null() {
-        if (end - p >= 4 && std::strncmp(p, "null", 4) == 0) { p += 4; lua_pushnil(L); return; }
-        err("bad literal");
-    }
-
-    void parse_number() {
-        const char* start = p;
-        if (peek() == '-') take();
-        while (p < end && ((*p >= '0' && *p <= '9') || *p == '.' || *p == 'e' || *p == 'E' ||
-                           *p == '+' || *p == '-')) take();
-        std::string s(start, p);
-        lua_pushnumber(L, std::strtod(s.c_str(), nullptr));
-    }
-};
-
-static void decode(lua_State* L, const std::string& s) {
-    Parser ps{s.data(), s.data() + s.size(), L};
-    ps.parse_value();
-    ps.ws();
-    if (ps.p != ps.end) throw std::runtime_error("json: trailing characters");
-}
-
-}  // namespace json
-
-// ───────────────────────────────────────────────────────────────────────
-// Minimal blocking HTTP client (used by rana.http_post / post_multipart).
-// Only http:// is supported; every request is checked against the endpoint
-// allowlist before a socket is opened.
-// ───────────────────────────────────────────────────────────────────────
-
-namespace {
-
-struct Url {
-    std::string scheme, host, path;
-    int port = 0;
-};
-
-// strtol-based integer parse that reports failure instead of throwing (these
-// run inside a lua_CFunction; a stray exception must never cross that boundary).
-bool parse_int(const std::string& s, long& out, int base = 10) {
-    if (s.empty()) return false;
-    errno = 0;
-    char* end = nullptr;
-    const long v = std::strtol(s.c_str(), &end, base);
-    if (errno != 0 || end == s.c_str()) return false;
-    // Tolerate trailing whitespace / chunk extensions (";ext").
-    while (*end == ' ' || *end == '\t' || *end == ';') {
-        ++end;
-        while (*end && *end != ';') ++end;
-    }
-    if (*end != '\0') return false;
-    out = v;
-    return true;
-}
-
-int default_port_for(const std::string& scheme) { return scheme == "https" ? 443 : 80; }
-
-bool parse_url(const std::string& raw, Url& u, std::string& err) {
-    size_t sp = raw.find("://");
-    if (sp == std::string::npos) { err = "missing scheme"; return false; }
-    u.scheme = raw.substr(0, sp);
-    if (u.scheme == "https") {
-#ifndef RANA_ENABLE_TLS
-        // Deny-by-default: a build without RANA_ENABLE_TLS cannot speak TLS, so
-        // reject https rather than silently connecting in the clear.
-        err = "https requires a TLS-enabled build (rebuild with --tls)";
-        return false;
-#endif
-    } else if (u.scheme != "http") {
-        err = "unsupported scheme (http only)";
-        return false;
-    }
-    std::string rest = raw.substr(sp + 3);
-    size_t slash = rest.find('/');
-    std::string authority = (slash == std::string::npos) ? rest : rest.substr(0, slash);
-    u.path = (slash == std::string::npos) ? "/" : rest.substr(slash);
-    size_t colon = authority.find(':');
-    if (colon == std::string::npos) {
-        u.host = authority;
-        u.port = default_port_for(u.scheme);
-    } else {
-        u.host = authority.substr(0, colon);
-        long p = 0;
-        if (!parse_int(authority.substr(colon + 1), p) || p <= 0 || p > 65535) {
-            err = "invalid port";
-            return false;
-        }
-        u.port = static_cast<int>(p);
-    }
-    if (u.host.empty()) { err = "missing host"; return false; }
-    return true;
-}
-
-// Set a receive/send deadline so a stalled upstream can never hang the
-// single-threaded daemon inside recv(). timeout_ms == 0 disables the deadline.
-void set_socket_timeout(int fd, uint32_t timeout_ms) {
-    if (timeout_ms == 0) return;
-    struct timeval tv{};
-    tv.tv_sec = static_cast<time_t>(timeout_ms / 1000);
-    tv.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000) * 1000);
-    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
-
-// ── Transport: plaintext or TLS ──────────────────────────────────────
-// One HTTP connection. Plaintext uses send/recv; with RANA_ENABLE_TLS a
-// https:// URL wraps the fd in OpenSSL with MANDATORY certificate + hostname
-// verification. Every failure is reported by return value — never an exception
-// (this runs inside a lua_CFunction). Only rana.provider_post() ever builds a TLS
-// connection; generic rana.http_post cannot reach a huggingface provider.
-struct Conn {
-    int fd = -1;
-    bool tls = false;
-#ifdef RANA_ENABLE_TLS
-    SSL* ssl = nullptr;
-#endif
-};
-
-#ifdef RANA_ENABLE_TLS
-// Process-wide client context (the daemon is single-threaded). Created lazily on
-// the first https request. Returns nullptr if OpenSSL could not be set up.
-SSL_CTX* tls_ctx() {
-    static SSL_CTX* ctx = []() -> SSL_CTX* {
-        SSL_CTX* c = SSL_CTX_new(TLS_client_method());
-        if (!c) return nullptr;
-        SSL_CTX_set_verify(c, SSL_VERIFY_PEER, nullptr);
-        SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
-        if (SSL_CTX_set_default_verify_paths(c) != 1) {
-            SSL_CTX_free(c);
-            return nullptr;
-        }
-        return c;
-    }();
-    return ctx;
-}
-#endif
-
-// Wrap an already-connected fd in TLS when scheme == "https". Returns false (and
-// leaves the caller to close the fd) on any handshake/verification failure.
-bool conn_open(Conn& c, const std::string& scheme, const std::string& host) {
-    c.tls = false;
-    if (scheme != "https") return true;
-#ifdef RANA_ENABLE_TLS
-    SSL_CTX* ctx = tls_ctx();
-    if (!ctx) return false;
-    c.ssl = SSL_new(ctx);
-    if (!c.ssl) return false;
-    SSL_set_fd(c.ssl, c.fd);
-    // SNI + hostname verification: without these, a valid cert for ANY host
-    // would be accepted (a silent MITM).
-    SSL_set_tlsext_host_name(c.ssl, host.c_str());
-    SSL_set1_host(c.ssl, host.c_str());
-    if (SSL_connect(c.ssl) != 1) return false;
-    if (SSL_get_verify_result(c.ssl) != X509_V_OK) return false;
-    c.tls = true;
-    return true;
-#else
-    (void)host;
-    return false;
-#endif
-}
-
-ssize_t conn_send(Conn& c, const void* buf, size_t n) {
-#ifdef RANA_ENABLE_TLS
-    if (c.tls) return SSL_write(c.ssl, buf, static_cast<int>(n));
-#endif
-    return ::send(c.fd, buf, n, 0);
-}
-
-ssize_t conn_recv(Conn& c, void* buf, size_t n) {
-#ifdef RANA_ENABLE_TLS
-    if (c.tls) return SSL_read(c.ssl, buf, static_cast<int>(n));
-#endif
-    return ::recv(c.fd, buf, n, 0);
-}
-
-void conn_close(Conn& c) {
-#ifdef RANA_ENABLE_TLS
-    // Free the SSL object whenever it was allocated, even if the handshake
-    // failed before c.tls was set (otherwise SSL_new's object leaks).
-    if (c.ssl) { SSL_shutdown(c.ssl); SSL_free(c.ssl); c.ssl = nullptr; }
-#endif
-    if (c.fd >= 0) { ::close(c.fd); c.fd = -1; }
-}
-
-// Returns (status_code, body). On transport failure status is 0.
-std::pair<int, std::string> http_do(const std::string& method, const std::string& url,
-                                    const std::map<std::string, std::string>& headers,
-                                    const std::string& body,
-                                    const std::vector<LuaRuntime::Endpoint>& allow,
-                                    uint32_t timeout_ms) {
-    std::string err;
-    Url u;
-    if (!parse_url(url, u, err)) return {0, std::string("url error: ") + err};
-
-    bool ok = false;
-    for (const auto& e : allow) {
-        if (e.scheme == u.scheme && e.host == u.host && (e.port == u.port || e.port == 0)) {
-            ok = true;
-            break;
-        }
-    }
-    if (!ok) return {0, "destination not in endpoint allowlist"};
-
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    if (getaddrinfo(u.host.c_str(), std::to_string(u.port).c_str(), &hints, &res) != 0 || !res)
-        return {0, "dns failure"};
-
-    Conn conn;
-    bool tls_failed = false;
-    for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        set_socket_timeout(fd, timeout_ms);
-        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) { ::close(fd); continue; }
-        conn.fd = fd;
-        if (conn_open(conn, u.scheme, u.host)) break;
-        tls_failed = true;
-        conn_close(conn);
-    }
-    freeaddrinfo(res);
-    if (conn.fd < 0) return {0, tls_failed ? "tls handshake failed" : "connect failed"};
-
-    std::string req = method + " " + u.path + " HTTP/1.1\r\n";
-    // Host carries the port when it is not the scheme default (80 for http,
-    // 443 for https).
-    req += "Host: " + u.host +
-           (u.port == default_port_for(u.scheme) ? "" : ":" + std::to_string(u.port)) + "\r\n";
-    req += "Connection: close\r\n";
-    if (headers.find("Content-Type") == headers.end())
-        req += "Content-Type: application/json\r\n";
-    for (const auto& [k, v] : headers) req += k + ": " + v + "\r\n";
-    req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-    req += "\r\n";
-    req += body;
-
-    size_t sent = 0;
-    while (sent < req.size()) {
-        ssize_t w = conn_send(conn, req.data() + sent, req.size() - sent);
-        if (w <= 0) { conn_close(conn); return {0, "send failed"}; }
-        sent += static_cast<size_t>(w);
-    }
-
-    std::string resp;
-    char buf[4096];
-    for (;;) {
-        ssize_t r = conn_recv(conn, buf, sizeof(buf));
-        if (r <= 0) break;
-        resp.append(buf, static_cast<size_t>(r));
-    }
-    conn_close(conn);
-
-    auto header_end = resp.find("\r\n\r\n");
-    if (header_end == std::string::npos) return {0, "bad response"};
-    std::string head = resp.substr(0, header_end);
-    std::string body_out = resp.substr(header_end + 4);
-
-    int status = 0;
-    if (head.size() >= 12 && head.compare(0, 5, "HTTP/") == 0) {
-        long code = 0;
-        if (parse_int(head.substr(9, 3), code)) status = static_cast<int>(code);
-    }
-
-    // De-chunk if needed.
-    bool chunked = head.find("Transfer-Encoding: chunked") != std::string::npos;
-    if (chunked) {
-        std::string decoded;
-        size_t pos = 0;
-        while (pos < body_out.size()) {
-            size_t nl = body_out.find("\r\n", pos);
-            if (nl == std::string::npos) break;
-            long sz = 0;
-            if (!parse_int(body_out.substr(pos, nl - pos), sz, 16) || sz < 0) break;
-            if (sz == 0) break;
-            decoded += body_out.substr(nl + 2, static_cast<size_t>(sz));
-            pos = nl + 2 + static_cast<size_t>(sz) + 2;
-        }
-        body_out = decoded;
-    }
-    return {status, body_out};
-}
-
-}  // namespace
 
 // ───────────────────────────────────────────────────────────────────────
 // Bridge status helpers
@@ -886,7 +185,7 @@ std::set<ScriptFlag> table_to_flags(lua_State* L, int idx) {
 //                               Any caller args fail closed. This is how
 //                               privileged verbs (shutdown/reboot/suspend via
 //                               sudo, docker container * mc-server) stay
-//                               hardcoded in init.lua and the binary-allowlist
+//                               hardcoded in init.pluto and the binary-allowlist
 //                               boundary can never become an arbitrary shell.
 static bool build_spawn_argv(lua_State* L, const LuaRuntime::BinaryEntry& entry,
                              const std::string& name, std::vector<std::string>& argv,
@@ -1015,7 +314,7 @@ int rana_providers(lua_State* L) {
 // RANA_ENABLE_TLS, [security].external_egress true, and the URL is https (routing
 // an external answer back into a script is a separate, inbound gate — see
 // rana_script_metas' external_egress). A "local" provider may only dial a host
-// already in the scripts/init.lua endpoint allowlist. The third value is the HTTP
+// already in the scripts/init.pluto endpoint allowlist. The third value is the HTTP
 // status (0 == transport failure or a gate refusal), matching rana.http_post.
 int rana_provider_post(lua_State* L) {
     LuaRuntime* rt = rt_from_up(L);
@@ -1045,7 +344,7 @@ int rana_provider_post(lua_State* L) {
     }
     std::map<std::string, std::string> headers = table_to_map(L, 4);
 
-    std::vector<LuaRuntime::Endpoint> allow;
+    std::vector<Endpoint> allow;
     if (p.type == "huggingface") {
         // The bridge owns Authorization on a cloud call: drop any script-supplied
         // one so a script cannot smuggle a different credential.
@@ -1293,7 +592,7 @@ bool valid_module_name(const std::string& s) {
 }
 
 // The ONLY loader installed in a script state: it resolves require("lib.<name>")
-// to a reviewed file under <scripts_dir>/lib/<name>.lua and refuses everything
+// to a reviewed file under <scripts_dir>/lib/<name>.pluto and refuses everything
 // else (both other namespaces and any traversal). This lets shared Lua helpers be
 // factored out idiomatically without reopening package.path/searchers.
 int rana_lib_searcher(lua_State* L) {
@@ -1306,7 +605,7 @@ int rana_lib_searcher(lua_State* L) {
     }
     std::string rel = mod;
     for (char& c : rel) if (c == '.') c = '/';
-    const std::string path = rt->scripts_dir() + "/" + rel + ".lua";
+    const std::string path = rt->scripts_dir() + "/" + rel + ".pluto";
     if (::access(path.c_str(), R_OK) != 0) {
         lua_pushfstring(L, "module '%s' not found", name);
         return 1;
@@ -1545,6 +844,9 @@ std::vector<std::string> LuaRuntime::available_scripts() const {
     struct dirent* e;
     while ((e = readdir(d)) != nullptr) {
         std::string fn(e->d_name);
+        // init.pluto is the system-interface registry (run once in init()), not a
+        // command module: it returns no meta and must never be dispatched.
+        if (fn == "init.pluto") continue;
         if (fn.size() > 6 && fn.compare(fn.size() - 6, 6, ".pluto") == 0) {
             keys.push_back(fn.substr(0, fn.size() - 6));
         }
@@ -1558,14 +860,14 @@ bool LuaRuntime::init(const Config& cfg, std::string& err) {
     scripts_dir_ = rana::resolve_scripts_dir(cfg);
     allowed_ = cfg.allowed;
 
-    // 1) Run init.lua (the system interface registry).
+    // 1) Run init.pluto (the system interface registry).
     {
-        const std::string init_path = scripts_dir_ + "/init.lua";
+        const std::string init_path = scripts_dir_ + "/init.pluto";
         lua_State* L = new_state();
         if (luaL_dofile(L, init_path.c_str()) != LUA_OK) {
             std::string e = lua_tostring(L, -1);
             lua_close(L);
-            err = "init.lua failed: " + e;
+            err = "init.pluto failed: " + e;
             return false;
         }
         lua_close(L);
@@ -1806,7 +1108,7 @@ void LuaRuntime::request_respond(const std::string& key, const std::string& acti
 
 // Accessors used by the C bridge functions.
 const std::map<std::string, LuaRuntime::BinaryEntry>& LuaRuntime::binaries() const { return binaries_; }
-const std::vector<LuaRuntime::Endpoint>& LuaRuntime::endpoints() const { return endpoints_; }
+const std::vector<Endpoint>& LuaRuntime::endpoints() const { return endpoints_; }
 uint32_t LuaRuntime::current_timeout() const { return current_timeout_; }
 uint32_t LuaRuntime::current_etl_timeout() const { return current_etl_timeout_; }
 

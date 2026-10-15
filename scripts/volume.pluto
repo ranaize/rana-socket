@@ -29,10 +29,10 @@ M.meta = {
 -- ("turn the volume up", "mute", "set it to 50").
 function M.execute(cmd)
     local action = cmd.action
-    local arg = cmd.target or ""
+    local arg = cmd.target ?? ""
     if not action or action == "" then
         local lvl = verbs.first_number(arg)
-        if verbs.fold(arg):match("mute") then
+        if "mute" in verbs.fold(arg) then
             action, arg = "set", "0"
         elseif lvl then
             action, arg = "set", lvl
@@ -43,22 +43,22 @@ function M.execute(cmd)
             }, "get")
         end
     end
-    if action ~= "set" and action ~= "get" and action ~= "up" and action ~= "down" then
-        return result.error("unknown volume action: " .. tostring(action))
+    if not (action in { "set", "get", "up", "down" }) then
+        return result.error($"unknown volume action: {action}")
     end
 
     if action == "set" then
-        arg = tostring(arg or "")
+        arg = tostring(arg ?? "")
     else
         arg = action
     end
 
-    local ok, res = exec.run("espeak", "volume " .. arg)
+    local ok, res = exec.run("espeak", $"volume {arg}")
     if not ok then
         return result.error(res)
     end
 
-    return result.ok((res.out or ""):gsub("%s+$", ""))
+    return result.ok((res.out ?? ""):gsub("%s+$", ""))
 end
 
 return M

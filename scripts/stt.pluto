@@ -22,9 +22,9 @@ M.meta = {
     flags = { rana.flags.LONG_IDLE },
 }
 
-local function clip(s, n)
-    if #s > (n or 2000) then
-        return string.sub(s, 1, (n or 2000)) .. "..."
+local function clip(s, n = 2000)
+    if #s > n then
+        return $"{string.sub(s, 1, n)}..."
     end
     return s
 end
@@ -53,36 +53,34 @@ end
 -- the upstream's own answer and stops the chain. `allow_cloud == false` opts THIS
 -- call out of every "huggingface" provider.
 function M.stt(wav, allow_cloud)
-    if not wav or #wav == 0 then
+    if !wav or #wav == 0 then
         rana.log("error", "stt: empty wav payload")
         return ""
     end
 
     for i, p in ipairs(providers("stt")) do
-        if p.type ~= "huggingface" or allow_cloud ~= false then
-            local model = (p.model ~= nil and p.model ~= "") and p.model or "talk"
+        if p.type != "huggingface" or allow_cloud != false then
+            local model = (p.model ?? "") != "" ? p.model : "talk"
             local body, ctype = transcribe_body(model, wav)
-            rana.log("debug", "stt: provider #" .. i .. " (" .. tostring(p.type) ..
-                     ", model=" .. model .. ", wav=" .. #wav .. " bytes)")
+            rana.log("debug", $"stt: provider #{i} ({p.type}, model={model}, wav={#wav} bytes)")
             -- Third return is the HTTP status (0 == transport failure or a gate
             -- refusal). Only that may advance to the next provider — never a live
             -- 4xx/5xx, which is the upstream's own answer.
             local ok, resp, status = rana.provider_post("stt", i, body, { ["Content-Type"] = ctype })
             if ok then
                 local j = rana.json_decode(resp)
-                if j and j.text then
+                if j?.text then
                     local text = tostring(j.text)
-                    rana.log("debug", "stt: transcript (" .. #text .. " chars): " .. clip(text, 500))
+                    rana.log("debug", $"stt: transcript ({#text} chars): {clip(text, 500)}")
                     return text
                 end
-                rana.log("error", "stt: no text in response (" .. #resp .. " bytes): " .. clip(resp))
+                rana.log("error", $"stt: no text in response ({#resp} bytes): {clip(resp)}")
                 return ""
-            elseif status ~= nil and status ~= 0 then
-                rana.log("error", "stt: provider #" .. i .. " answered status " .. tostring(status) ..
-                         " -> " .. clip(tostring(resp)))
+            elseif status != nil and status != 0 then
+                rana.log("error", $"stt: provider #{i} answered status {status} -> {clip(tostring(resp))}")
                 return ""
             end
-            rana.log("info", "stt: provider #" .. i .. " unreachable, trying next")
+            rana.log("info", $"stt: provider #{i} unreachable, trying next")
         end
     end
     return ""
@@ -93,11 +91,11 @@ end
 -- cmd.params.cloud = "false" to forbid a huggingface provider for this call.
 function M.execute(cmd)
     local wav = cmd.target
-    if (wav == nil or #wav == 0) and cmd.data ~= nil and #cmd.data > 0 then
+    if (wav == nil or #wav == 0) and cmd.data != nil and #cmd.data > 0 then
         wav = cmd.data
     end
-    local allow_cloud = not (cmd.params and cmd.params.cloud == "false")
-    return M.stt(wav or "", allow_cloud)
+    local allow_cloud = cmd.params?.cloud != "false"
+    return M.stt(wav ?? "", allow_cloud)
 end
 
 return M

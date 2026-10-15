@@ -19,8 +19,8 @@ M.meta = {
 }
 
 function M.execute(cmd)
-    local action = cmd.action or "play"
-    local what = cmd.target or ""
+    local action = cmd.action ?? "play"
+    local what = cmd.target ?? ""
     if what == "" then
         return result.error("missing url/title")
     end
@@ -30,7 +30,7 @@ function M.execute(cmd)
         return result.error(res)
     end
 
-    return result.ok(action .. " " .. what)
+    return result.ok($"{action} {what}")
 end
 
 return M

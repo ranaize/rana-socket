@@ -1,4 +1,4 @@
--- scripts/init.lua
+-- scripts/init.pluto
 -- Executed once at daemon startup, before any command scripts. Defines the
 -- system interface: which binaries and network endpoints scripts may reach.
 -- This is the single source of truth for the escape-hatch boundary — the scripts
@@ -49,10 +49,10 @@ rana.allow_endpoints({
 -- through the rana.provider_post() bridge. [security].external_egress=false
 -- disables the whole huggingface tier. Separately, an ANSWER from a huggingface
 -- provider may only be routed into scripts that opt in with
--- rana.flags.EXTERNAL_EGRESS (see scripts/lib/route.lua; off by default).
+-- rana.flags.EXTERNAL_EGRESS (see scripts/lib/route.pluto; off by default).
 
 -- NOTE: no command/variant registration here. The registry is [commands.allowed]
 -- in TOML plus the scripts/ scan; each script self-describes via its meta table.
--- Scripts also share reviewed helpers from scripts/lib/*.lua via
+-- Scripts also share reviewed helpers from scripts/lib/*.pluto via
 -- require("lib.<name>") (resolved by a restricted searcher that reads only that
 -- directory).

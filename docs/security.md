@@ -63,7 +63,7 @@ After opening, the sandbox additionally:
 
 ### 3. Bridge allowlists (the only sanctioned escape hatches)
 All privileged actions go through the `rana.*` C bridge and are gated:
-- `rana.spawn(...)` — only binaries present in the `init.lua` allowlist.
+- `rana.spawn(...)` — only binaries present in the `init.pluto` allowlist.
 - `rana.dispatch(...)` / `rana.respond(...)` — only `[commands.allowed]` keys.
 - `rana.http_post(...)` — only hosts present in the endpoint allowlist.
 - `rana.audio.decode_to_wav(...)` — in-process codec; no shell, no network.
@@ -90,7 +90,7 @@ Providers are tried in order; a provider answers when it returns 2xx (or a live
 optional `type` field must agree with it:
 
 - **Local tier** — `type = "local"` (`http://`). The host must already be listed
-  in `rana.allow_endpoints(...)` in `scripts/init.lua`; reached via
+  in `rana.allow_endpoints(...)` in `scripts/init.pluto`; reached via
   `rana.http_post`/`rana.provider_post`. This is the LocalAI/Whisper path.
 - **Hugging Face tier** — `type = "huggingface"` (`https://`), reached **only**
   via `rana.provider_post`. Scripts cannot add to it or name its host; generic
@@ -121,14 +121,14 @@ checked against the request host, with TLS 1.2 minimum.
 Egress is only half the risk: a remote model's *answer* is untrusted (it can be
 steered by whatever the microphone picked up), so acting on it is gated too.
 - An answer that came from a `type = "huggingface"` provider is stamped
-  `external` by `lib/llm.lua` from the provider that **answered** — never from
+  `external` by `lib/llm.pluto` from the provider that **answered** — never from
   the reply text — so the model cannot spoof it.
-- `scripts/lib/route.lua` then refuses to dispatch or relay an external answer
+- `scripts/lib/route.pluto` then refuses to dispatch or relay an external answer
   to any script that has not opted in with `rana.flags.EXTERNAL_EGRESS` in its
   `meta.flags` (read back via `rana.script_metas().external_egress`). **Off by
   default**: a remote model can reach nothing until the operator opts scripts in
   — including `speak` (itself a script), if replies should be spoken.
-- A refusal never executes and never reaches the peer. `scripts/lib/refuse.lua`
+- A refusal never executes and never reaches the peer. `scripts/lib/refuse.pluto`
   owns the ladder: speak a short reason (only if `speak` opted in), else log and
   drop, else `SAFETY_GATE_FAILED`. It is isolated and read-only.
 - Local (non-external) answers are unaffected — the local model stays trusted.
@@ -136,16 +136,16 @@ steered by whatever the microphone picked up), so acting on it is gated too.
 ### 5. Script registration
 - The daemon scans `scripts/*.pluto` at startup and reads each script's `meta`
   (name, description, actions, params, timeout, examples, flags). Scripts are
-  self-describing and must declare what they do; `init.lua` only registers the
+  self-describing and must declare what they do; `init.pluto` only registers the
   binary/endpoint allowlists.
 - A per-script execution timeout bounds blast radius. Scripts cannot touch the
   filesystem directly (`io`/`os` are stripped); the only file access is the
-  host-side `lib/` searcher, which reads the reviewed `scripts/lib/*.lua` only.
+  host-side `lib/` searcher, which reads the reviewed `scripts/lib/*.pluto` only.
 
 ## In-process hops
 `talk.pluto` reaches `stt.pluto` and `ask.pluto` through the generic
-`rana.dispatch` hop; `ask.pluto` builds its intent from `lib/llm.lua` +
-`lib/fuzzy.lua`. Hops run in the **same locked-down state** — the runtime does
+`rana.dispatch` hop; `ask.pluto` builds its intent from `lib/llm.pluto` +
+`lib/fuzzy.pluto`. Hops run in the **same locked-down state** — the runtime does
 not grant them extra privileges. The one confirmation gate is `power.pluto`:
 a destructive power action requires the client's explicit `params.confirm` and
 otherwise fails closed (`SAFETY_GATE_FAILED`).

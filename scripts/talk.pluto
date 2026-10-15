@@ -30,7 +30,7 @@ M.meta = {
 }
 
 function M.execute(cmd)
-    local audio = cmd.data or ""
+    local audio = cmd.data ?? ""
     if #audio == 0 then
         return result.invalid("no audio")
     end
@@ -39,22 +39,22 @@ function M.execute(cmd)
     local sample_rate = 16000
     local channels = 1
     if cmd.params then
-        if cmd.params.encoding ~= nil then encoding = tostring(cmd.params.encoding) end
-        if cmd.params.sample_rate ~= nil then sample_rate = tonumber(cmd.params.sample_rate) or 16000 end
-        if cmd.params.channels ~= nil then channels = tonumber(cmd.params.channels) or 1 end
+        encoding = tostring(cmd.params.encoding ?? encoding)
+        sample_rate = tonumber(cmd.params.sample_rate ?? sample_rate) ?? sample_rate
+        channels = tonumber(cmd.params.channels ?? channels) ?? channels
     end
 
     -- Decode the raw payload to WAV; the codec lives in C++ (rana.audio module).
     local wav = rana.audio.decode_to_wav(audio, encoding, sample_rate, channels)
     if not wav or #wav == 0 then
-        return result.invalid("unsupported audio encoding: " .. encoding)
+        return result.invalid($"unsupported audio encoding: {encoding}")
     end
 
     -- STT hop (scripts/stt.pluto): the WAV rides in the args table's `target`
     -- slot (binary-safe); internal marks a PIPELINE hop (stt is not in
     -- [commands.allowed]). Returns {status, message} with the transcript in `message`.
     local t = rana.dispatch("stt", "stt", { target = wav, internal = true })
-    if type(t) ~= "table" or t.status ~= "ok" or not t.message or t.message == "" then
+    if type(t) != "table" or t.status != "ok" or !t.message or t.message == "" then
         return result.error("stt returned nothing")
     end
 

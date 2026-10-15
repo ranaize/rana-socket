@@ -1,4 +1,4 @@
--- scripts/lib/fuzzy.lua
+-- scripts/lib/fuzzy.pluto
 --
 -- The lexical pre-router (ported from the old executor.cpp pre-router). Routing
 -- happens lexically first, then the LLM: a confident keyword hit never costs a
@@ -24,14 +24,15 @@ local SKIP = { ask = true, speak = true, talk = true, stt = true }
 
 local function tokenize(s)
     local out = {}
-    for w in (s or ""):lower():gmatch("%a+") do out[#out + 1] = w end
+    for w in (s ?? ""):lower():gmatch("%a+") do out[#out + 1] = w end
     return out
 end
 
 local function drop_stopwords(s)
     local out = {}
     for _, w in ipairs(tokenize(s)) do
-        if not STOPWORDS[w] then out[#out + 1] = w end
+        if STOPWORDS[w] then continue end
+        out[#out + 1] = w
     end
     return out
 end
@@ -45,7 +46,9 @@ local function overlap_count(haystack, needles)
     local h = {}
     for _, w in ipairs(haystack) do h[w] = true end
     local n = 0
-    for _, w in ipairs(needles) do if h[w] then n = n + 1 end end
+    for _, w in ipairs(needles) do
+        if h[w] then n += 1 end
+    end
     return n
 end
 
@@ -55,13 +58,15 @@ end
 function M.best_command(text)
     local qt = drop_stopwords(text)
     if #qt == 0 then return nil end
+
     local qnorm = norm_meaningful(text)
-    local metas = rana.script_metas() or {}
+    local metas = rana.script_metas() ?? {}
 
     -- Danger commands: exact phrase only.
     for key, m in pairs(metas) do
-        if not SKIP[key] and m.danger then
-            for _, kw in ipairs(m.keywords or {}) do
+        if SKIP[key] then continue end
+        if m.danger then
+            for _, kw in ipairs(m.keywords ?? {}) do
                 if norm_meaningful(kw) == qnorm then return key end
             end
         end
@@ -70,20 +75,18 @@ function M.best_command(text)
     -- Everything else: best meaningful-token overlap with description+keywords.
     -- Need at least one overlapping token, and roughly half the query's
     -- meaningful tokens, so a single common word can't false-route.
-    local need = #qt <= 2 and 1 or math.floor((#qt + 1) / 2)
+    local need = #qt <= 2 ? 1 : math.floor((#qt + 1) / 2)
     local best, best_score
     for key, m in pairs(metas) do
-        if not SKIP[key] and not m.danger then
-            local corpus = drop_stopwords(m.description or "")
-            for _, kw in ipairs(m.keywords or {}) do
-                for _, tok in ipairs(drop_stopwords(kw)) do corpus[#corpus + 1] = tok end
-            end
-            if #corpus > 0 then
-                local ov = overlap_count(corpus, qt)
-                if ov >= need and ov > (best_score or 0) then
-                    best, best_score = key, ov
-                end
-            end
+        if SKIP[key] or m.danger then continue end
+        local corpus = drop_stopwords(m.description ?? "")
+        for _, kw in ipairs(m.keywords ?? {}) do
+            for _i, tok in ipairs(drop_stopwords(kw)) do corpus[#corpus + 1] = tok end
+        end
+        if #corpus == 0 then continue end
+        local ov = overlap_count(corpus, qt)
+        if ov >= need and ov > (best_score ?? 0) then
+            best, best_score = key, ov
         end
     end
     return best
@@ -91,25 +94,21 @@ end
 
 function M.extract_url(text)
     local url = string.match(text, "https?://[%w%.%-%_~/:%?%%&=+#@]+")
-    if url then return url end
-    return string.match(text, "www%.[%w%.%-]+")
+    return url ?? string.match(text, "www%.[%w%.%-]+")
 end
 
 -- Fuzzy hit -> {action, payload} with the script-specific operand extracted from
 -- the spoken words. Multi-verb scripts (power/mc_server/media/lights/volume) get
 -- the raw text and infer the verb themselves; the single-verb ones need the URL
--- / name / title pulled out.
+-- / name / title pulled out. The operand pick is a switch expression.
 function M.route(text)
     local key = M.best_command(text)
-    if not key then return nil end
-    rana.log("fuzzy", "transcript '" .. text .. "' routed to " .. key .. " (no LLM)")
-    local payload
-    if key == "browser" then
-        payload = M.extract_url(text) or ""
-    elseif key == "play_movie" then
-        payload = M.extract_url(text) or text
-    else
-        payload = text
+    if key == nil then return nil end
+    rana.log("fuzzy", $"transcript '{text}' routed to {key} (no LLM)")
+    local payload = switch key do
+        case "browser"    -> M.extract_url(text) ?? ""
+        case "play_movie" -> M.extract_url(text) ?? text
+        default           -> text
     end
     return { action = key, payload = payload }
 end

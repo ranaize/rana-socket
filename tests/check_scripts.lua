@@ -1,15 +1,15 @@
 -- tests/check_scripts.lua
 --
--- Load-check every command script and the startup init.lua under a stubbed
+-- Load-check every command script and the startup init.pluto under a stubbed
 -- `rana` bridge. The daemon scans scripts/ at startup and (today) hard-fails the
 -- whole process on one malformed script, so the cheapest guard is to load each
 -- one here: every scripts/*.pluto must return a module table carrying a `meta`
 -- table and an `execute` function.
 --
--- Run from the repo root:   lua tests/check_scripts.lua
+-- Run from the repo root:   pluto tests/check_scripts.lua
 
 -- Resolve lib/ helpers the same way the bridge's restricted searcher does.
-package.path = "scripts/?.lua;" .. package.path
+package.path = "scripts/?.pluto;" .. package.path
 
 local function stub_rana()
     local noop = function() return true end
@@ -44,23 +44,27 @@ local function fail(msg)
     io.stderr:write("FAIL: " .. msg .. "\n")
 end
 
--- init.lua: must load and run (it only registers the binary/endpoint allowlists).
+-- init.pluto: must load and run (it only registers the binary/endpoint allowlists).
 do
-    local chunk, err = loadfile("scripts/init.lua")
+    local chunk, err = loadfile("scripts/init.pluto")
     if not chunk then
-        fail("scripts/init.lua: " .. tostring(err))
+        fail("scripts/init.pluto: " .. tostring(err))
     else
         local ok, e = pcall(chunk)
-        if not ok then fail("scripts/init.lua: " .. tostring(e)) end
+        if not ok then fail("scripts/init.pluto: " .. tostring(e)) end
     end
 end
 
 -- Command scripts: each must return { meta = {...}, execute = function }.
+-- init.pluto is the system-interface registry, not a command module (it is
+-- loaded and run above), so it is excluded from this scan.
 local function script_files()
     local out = {}
     local p = io.popen("ls scripts/*.pluto 2>/dev/null")
     if p then
-        for line in p:lines() do out[#out + 1] = line end
+        for line in p:lines() do
+            if line ~= "scripts/init.pluto" then out[#out + 1] = line end
+        end
         p:close()
     end
     return out

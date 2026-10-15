@@ -11,7 +11,7 @@
 #     scripts/talk.pluto → scripts/stt.pluto); ask/talk/stt are in-process
 #     Pluto hops, not shell scripts. The daemon owns all LocalAI/STT calls.
 #   - Each script self-describes (meta) and the actual executables it may reach
-#     are whitelisted in scripts/init.lua, not here.
+#     are whitelisted in scripts/init.pluto, not here.
 
 [daemon]
 socket_type = "tcp"
@@ -40,7 +40,7 @@ allowed_ips = ["127.0.0.1", "172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"]
 # (local = 100, huggingface = 200), then file order.
 #
 #   type   = "local" | "huggingface"  ACL tier; MUST match the URL scheme
-#   url    = http:// for local (the host must be in scripts/init.lua's
+#   url    = http:// for local (the host must be in scripts/init.pluto's
 #            allow_endpoints), https:// for huggingface (--tls build)
 #   schema = "openai" (default; the only supported wire dialect —
 #            /v1/chat/completions + /v1/audio/transcriptions)
@@ -56,7 +56,7 @@ timeout_ms = 30000
 
 # Hugging Face fallback (optional; requires a --tls build + [security]
 # external_egress). Reached only when the local entry above is UNREACHABLE. Its
-# ANSWER is stamped "external", and scripts/lib/route.lua will only route such an
+# ANSWER is stamped "external", and scripts/lib/route.pluto will only route such an
 # answer into a script that opts in with rana.flags.EXTERNAL_EGRESS (off by
 # default), so a remote model can never reach, e.g., power.
 # [[llm.provider]]
@@ -85,6 +85,6 @@ timeout_ms = 30000
 
 # Fleet/incident policy. external_egress=false hard-disables EVERY huggingface
 # provider even when one is configured; the local endpoint allowlist in
-# scripts/init.lua is unaffected.
+# scripts/init.pluto is unaffected.
 [security]
 external_egress = true

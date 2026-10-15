@@ -20,7 +20,7 @@ M.meta = {
 }
 
 function M.execute(cmd)
-    local name = cmd.target or ""
+    local name = cmd.target ?? ""
     if name == "" then
         return result.error("missing name")
     end
@@ -30,7 +30,7 @@ function M.execute(cmd)
         return result.error(res)
     end
 
-    return result.ok((res.out or ""):gsub("%s+$", ""))
+    return result.ok((res.out ?? ""):gsub("%s+$", ""))
 end
 
 return M

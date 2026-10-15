@@ -1,8 +1,8 @@
--- scripts/lib/refuse.lua
+-- scripts/lib/refuse.pluto
 --
 -- What the daemon does when it REFUSES a route: an answer from an EXTERNAL
 -- (huggingface) provider targeted a script that did not opt in via
--- rana.flags.EXTERNAL_EGRESS (see lib/route.lua). Kept in one reviewed, isolated
+-- rana.flags.EXTERNAL_EGRESS (see lib/route.pluto). Kept in one reviewed, isolated
 -- place because "what happens on refusal" is the trust boundary itself.
 --
 -- Three levels, most graceful first; route.lua walks them in order and applies
@@ -19,21 +19,21 @@ M.LEVELS = { "reply", "log", "fail" }
 -- A short, spoken-friendly reason. Never echoes the model's raw output (which is
 -- untrusted) back to the user or the logs.
 function M.reason(target)
-    return "I can't do " .. tostring(target) .. " from a remote answer."
+    return $"I can't do {target} from a remote answer."
 end
 
 -- Pick the level: prefer speaking to the user (only when the TTS sink itself
 -- opted in), else log, else fail closed. `can_log` defaults true.
-function M.level(can_reply, can_log)
-    if can_reply then return "reply" end
-    if can_log ~= false then return "log" end
-    return "fail"
+-- Pluto: default argument + ternary expression.
+function M.level(can_reply, can_log = true)
+    return can_reply ? "reply" : (can_log ? "log" : "fail")
 end
 
 -- Frozen view: the returned table is read-only, so nothing can repoint a level
--- or the reason builder mid-run.
+-- or the reason builder mid-run. (Hand-rolled rather than table.freeze, which is
+-- not compiled into the daemon's embedded runtime.)
 return setmetatable({}, {
     __index = M,
-    __newindex = function() error("lib.refuse is immutable", 2) end,
+    __newindex = |_| -> error("lib.refuse is immutable", 2),
     __metatable = false,
 })

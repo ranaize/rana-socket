@@ -79,7 +79,7 @@ RUN predep
 
 ############################ runtime ############################
 FROM debian:bookworm-20260824-slim AS runtime
-# espeak-ng is the only host binary the default scripts spawn (see scripts/init.lua).
+# espeak-ng is the only host binary the default scripts spawn (see scripts/init.pluto).
 # Everything else (ask/stt) runs in-process via Pluto; the other script backends
 # (lights/media/power/...) are deployment-specific and expected on the host.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -90,7 +90,7 @@ COPY --from=builder /src/socket/bin/Release/rana-socketd /usr/local/bin/rana-soc
 # Pluto shared lib — must sit beside the binary so the $ORIGIN rpath resolves it.
 COPY --from=builder /src/vendor/pluto/src/libpluto.so /usr/local/bin/libpluto.so
 # Self-describing scripts + the system-interface registry. No shell hops, no python.
-COPY --from=builder /src/scripts/init.lua /opt/rana/scripts/init.lua
+COPY --from=builder /src/scripts/init.pluto /opt/rana/scripts/init.pluto
 COPY --from=builder /src/scripts/*.pluto /opt/rana/scripts/
 # Shared helpers required as lib/<name> by the scripts (resolved by the bridge's
 # restricted searcher); without these every script that requires one fails to load.

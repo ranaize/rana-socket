@@ -1,11 +1,11 @@
 -- tests/test_lib.lua
 --
--- Unit tests for the shared scripts/lib/*.lua helpers. Pure Lua: a stubbed
--- `rana` bridge stands in for the C side, so this runs anywhere Lua does.
+-- Unit tests for the shared scripts/lib/*.pluto helpers. Pure Pluto: a stubbed
+-- `rana` bridge stands in for the C side, so this runs anywhere Pluto does.
 --
--- Run from the repo root:   lua tests/test_lib.lua
+-- Run from the repo root:   pluto tests/test_lib.lua
 
-package.path = "scripts/?.lua;" .. package.path
+package.path = "scripts/?.pluto;" .. package.path
 
 local calls = {}
 local bridge = {
@@ -184,7 +184,7 @@ check(g5 == nil, "external reply returns nil")
 bridge.script_metas = function() return {} end
 calls = {}
 local g6 = route.route({ action = "browser", payload = "https://x" })
-check(calls[1] and calls[1][1] == "dispatch", "local answer reaches a non-opted-in script")
+check(g6 and calls[1] and calls[1][1] == "dispatch", "local answer reaches a non-opted-in script")
 
 -- ── fuzzy ─────────────────────────────────────────────────────────────────
 local fuzzy = require("lib.fuzzy")
@@ -323,10 +323,10 @@ do
         check(kind == "llm", "providers called with kind=llm")
         return { { type = "local", model = "command" } }
     end
-    bridge.provider_post = function(kind, i, body)
+    bridge.provider_post = function(kind, i, req)
         seen[#seen + 1] = i
         check(kind == "llm", "provider_post kind=llm")
-        check(type(body) == "table" and body.model == "command", "body carries the model")
+        check(type(req) == "table" and req.model == "command", "body carries the model")
         return true, '{"choices":[{"message":{"content":"primary text"}}]}', 200
     end
     local r = llm.ask("what is the meaning of life")

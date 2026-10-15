@@ -24,7 +24,7 @@ M.meta = {
 -- "play the next song").
 function M.execute(cmd)
     local action = cmd.action
-    local target = cmd.target or ""
+    local target = cmd.target ?? ""
     if not action or action == "" then
         action = verbs.infer(target, {
             { verb = "pause", patterns = { "pause" } },
@@ -44,7 +44,7 @@ function M.execute(cmd)
         return result.error(res)
     end
 
-    return result.ok("media " .. action)
+    return result.ok($"media {action}")
 end
 
 return M

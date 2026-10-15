@@ -19,7 +19,7 @@ M.meta = {
 }
 
 function M.execute(cmd)
-    local text = cmd.target or ""
+    local text = cmd.target ?? ""
     if text == "" then
         return result.error("nothing to speak")
     end
@@ -29,7 +29,7 @@ function M.execute(cmd)
         return result.error(res)
     end
 
-    return result.ok("spoke: " .. text)
+    return result.ok($"spoke: {text}")
 end
 
 return M

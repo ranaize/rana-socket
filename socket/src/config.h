@@ -15,7 +15,7 @@ std::string normalize_key(const std::string& key);
 
 struct Config;  // forward declaration; full definition below
 
-// Resolve the directory holding init.lua + the *.pluto scripts. Resolution order:
+// Resolve the directory holding init.pluto + the *.pluto scripts. Resolution order:
 //   1. $RANA_SCRIPTS_DIR            explicit override (set by `make server`/`make client`)
 //   2. daemon.scripts_dir from config (absolute, or relative to the config's dir)
 //   3. autodiscover: walk up from the daemon binary's directory, then fixed
@@ -39,11 +39,11 @@ struct DaemonConfig {
 // A provider answers when it returns 2xx (or a live 4xx/5xx — the upstream's own
 // answer); only a TRANSPORT failure/timeout advances to the next entry.
 struct ProviderConfig {
-    // ACL tier. "local" => http, host must already be in the scripts/init.lua
+    // ACL tier. "local" => http, host must already be in the scripts/init.pluto
     // allow_endpoints list. "huggingface" => https, usable only from a
     // RANA_ENABLE_TLS build and only when [security].external_egress is true.
     // (Routing an external answer back into a script is a separate, inbound gate
-    // — see ScriptFlag::ExternalEgress and scripts/lib/route.lua.) `type` is
+    // — see ScriptFlag::ExternalEgress and scripts/lib/route.pluto.) `type` is
     // validated against the URL scheme so an ACL label can never contradict the
     // wire scheme (which would let a token-bearing call slip past the gates).
     std::string type;
@@ -66,7 +66,7 @@ struct SttConfig {
 
 // [security] — fleet/incident policy. external_egress=false hard-disables ALL
 // cloud fallback even when an endpoint is configured (the local endpoint
-// allowlist in init.lua is unaffected).
+// allowlist in init.pluto is unaffected).
 struct SecurityConfig {
     bool external_egress = true;
 };

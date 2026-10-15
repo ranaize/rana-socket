@@ -30,7 +30,7 @@ M.meta = {
 -- in cmd.action; room is unknown so it defaults to "all" (backend-wide toggle).
 function M.execute(cmd)
     local action = cmd.action
-    local room = cmd.target or ""
+    local room = cmd.target ?? ""
     if not action or action == "" then
         action = verbs.infer(room, {
             { verb = "off",   patterns = { "turn%-?off", "off the lights", "%f[%a]off%f[^%a]" } },
@@ -43,7 +43,7 @@ function M.execute(cmd)
 
     local args = { action, room }
     if action == "color" then
-        table.insert(args, cmd.params and cmd.params.color or "")
+        table.insert(args, cmd.params?.color ?? "")
     end
 
     local ok, res = exec.run("lights", table.unpack(args))
@@ -51,7 +51,7 @@ function M.execute(cmd)
         return result.error(res)
     end
 
-    return result.ok("lights " .. action .. " " .. room)
+    return result.ok($"lights {action} {room}")
 end
 
 return M

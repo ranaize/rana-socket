@@ -151,7 +151,7 @@ Hugging Face one. The Hugging Face tier is deny-by-default at every layer:
   stamped external and may only be *acted on* by a script that opts in with
   `rana.flags.EXTERNAL_EGRESS` — **off by default**, so a remote model can reach
   nothing until the operator opts scripts in (including `speak`, if replies
-  should be spoken). A refused route speaks/logs via `scripts/lib/refuse.lua`;
+  should be spoken). A refused route speaks/logs via `scripts/lib/refuse.pluto`;
   it is never dispatched and never relayed to the peer. A caller can still opt
   one request out of the cloud entirely with `{ cloud = false }`.
 

@@ -1,4 +1,4 @@
--- scripts/lib/llm.lua
+-- scripts/lib/llm.pluto
 --
 -- The LLM ask hop: fuzzy-route first, otherwise call the configured model and
 -- coerce its reply into an {action, payload} intent.
@@ -12,7 +12,7 @@
 -- token; the script never sees the URL it dials or the secret.
 --
 -- When a huggingface entry ANSWERS, the returned intent is stamped
--- `external = true` so lib/route.lua can restrict which scripts it may reach
+-- `external = true` so lib/route.pluto can restrict which scripts it may reach
 -- (see rana.flags.EXTERNAL_EGRESS).
 local rana = require("rana")
 local fuzzy = require("lib.fuzzy")
@@ -23,12 +23,12 @@ local M = {}
 -- prompt or repeat their answer; the routing object is flat, so scan every
 -- non-greedy {..} fragment and keep the last one that decodes.
 local function extract_json(text)
-    if not text then return nil end
+    if !text then return nil end
     local best, i0 = nil, 1
     while true do
         local s, e = string.find(text, "{.-}", i0)
-        if not s then break end
-        local j, _ = rana.json_decode(string.sub(text, s, e))
+        if !s then break end
+        local j = rana.json_decode(string.sub(text, s, e))
         if j then best = j end
         i0 = e + 1
     end
@@ -38,25 +38,28 @@ end
 -- Accept both schemas the model may drift across: {command, text} and
 -- {action, payload/target}. The fallback NEVER reads the model's rambling back
 -- to the user (that is how JSON/garbage got spoken): long or chatty output
--- (echoed routing prose) collapses to a short generic reply.
+-- (echoed routing prose) collapses to a short generic reply. `??` replaces the
+-- `or` chains (nil-only, which is what these fields are).
 function M.parse_action(content)
     local j = extract_json(content)
     if j then
-        local cmd = j.command or j.action
-        local payload = j.text or j.payload or j.target
-        if cmd and payload and payload ~= "" then
+        local cmd = j.command ?? j.action
+        local payload = j.text ?? j.payload ?? j.target
+        if cmd and payload and payload != "" then
             return tostring(cmd), tostring(payload)
         end
     end
-    local t = content or ""
+    local t = content ?? ""
     while true do
         local s, e = string.find(t, "{.-}")
-        if not s then break end
+        if !s then break end
         t = t:sub(1, s - 1) .. t:sub(e + 1)
     end
     t = t:gsub("%(%w+%)", "")                 -- drop "(question)"-style labels
     t = t:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if #t > 200 or t:find("action is", 1, true) or t:find("with target", 1, true) then
+    -- `in` is Pluto's substring/value-search operator, equivalent to a plain
+    -- find(..., 1, true) here.
+    if #t > 200 or "action is" in t or "with target" in t then
         return "reply", "I did not understand that."
     end
     if t == "" then t = "I did not catch that." end
@@ -65,11 +68,13 @@ end
 
 -- Extract the model's text from an OpenAI-compatible chat response. "openai" is
 -- the single supported wire dialect, so every provider answers in this shape.
+-- Safe navigation (`?.`) walks the optional intermediate links without a tower
+-- of `and` guards.
 local function chat_content(j)
-    if type(j) ~= "table" then return "" end
-    local c = j.choices and j.choices[1] and j.choices[1].message
-              and j.choices[1].message.content
-    if c and c ~= "" then return tostring(c) end
+    if type(j) != "table" then return "" end
+    local first = (j.choices ?? {})[1]
+    local c = first?.message?.content
+    if c and c != "" then return tostring(c) end
     if j.text then return tostring(j.text) end
     return ""
 end
@@ -88,48 +93,48 @@ end
 -- is the upstream's own answer and stops the chain. On any failure the intent
 -- degrades to a spoken reply rather than an error.
 function M.ask(text, opts)
-    opts = opts or {}
+    opts ??= {}
     local routed = fuzzy.route(text)
     if routed then return routed end
 
-    local allow_cloud = opts.cloud ~= false
+    local allow_cloud = opts.cloud != false
     local content, answered, external = "", false, false
     for i, p in ipairs(providers("llm")) do
-        if p.type ~= "huggingface" or allow_cloud then
-            local ok, resp, status = rana.provider_post("llm", i, {
-                model = p.model,
-                messages = {
-                    { role = "system", content = rana.get_system_prompt() },
-                    { role = "user",   content = text },
-                },
-                temperature = 0.2,
-                max_tokens = 256,
-            })
-            if ok then
-                answered = true
-                -- Stamp the ORIGIN from the provider that answered (never from
-                -- the reply text): lib/route.lua uses it to gate which scripts
-                -- an external answer may reach.
-                external = (p.type == "huggingface")
-                content = chat_content(rana.json_decode(resp))
-                break
-            elseif status ~= nil and status ~= 0 then
-                -- The provider answered (4xx/5xx): that response is the result,
-                -- never a cue to fall through to another provider.
-                answered = true
-                rana.log("error", "llm: provider #" .. i .. " returned HTTP " .. tostring(status))
-                break
-            end
-            rana.log("info", "llm: provider #" .. i .. " (" .. tostring(p.type) ..
-                     ") unreachable, trying next")
+        -- Skip a cloud provider when THIS call gated egress off, and otherwise
+        -- run the body (a `continue` keeps the happy path un-indented).
+        if p.type == "huggingface" and !allow_cloud then continue end
+        local ok, resp, status = rana.provider_post("llm", i, {
+            model = p.model,
+            messages = {
+                { role = "system", content = rana.get_system_prompt() },
+                { role = "user",   content = text },
+            },
+            temperature = 0.2,
+            max_tokens = 256,
+        })
+        if ok then
+            answered = true
+            -- Stamp the ORIGIN from the provider that answered (never from the
+            -- reply text): lib/route.pluto uses it to gate which scripts an
+            -- external answer may reach.
+            external = p.type == "huggingface"
+            content = chat_content(rana.json_decode(resp))
+            break
+        elseif status != nil and status != 0 then
+            -- The provider answered (4xx/5xx): that response is the result,
+            -- never a cue to fall through to another provider.
+            answered = true
+            rana.log("error", $"llm: provider #{i} returned HTTP {status}")
+            break
         end
+        rana.log("info", $"llm: provider {i} ({p.type}) unreachable; trying next")
     end
 
     -- No provider answered (none configured, all unreachable, or the only ones
     -- left were cloud providers this call opted out of): say so. A provider that
     -- answered 2xx (or a live 4xx/5xx) with nothing usable keeps the softer
     -- "did not catch that" path.
-    if not answered then
+    if !answered then
         return { action = "reply", payload = "Sorry, I could not reach the language model." }
     end
 
