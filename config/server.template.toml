@@ -33,15 +33,58 @@ allowed_ips = ["127.0.0.1", "172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"]
 "mc_server"       = true
 "lookup_machine"  = true
 
-# The daemon is the ONLY LocalAI caller. The ask hop (scripts/ask.pluto) reads
-# these to build its request. `make server` injects the real URL via environment.
+# The daemon is the ONLY LocalAI caller. Each hop is an ORDERED provider chain:
+# entries are tried top to bottom, and only a TRANSPORT failure/timeout from one
+# advances to the next (a live 4xx/5xx is the upstream's own answer and stops the
+# chain). `order` is optional; with none given the default is local-first
+# (local = 100, huggingface = 200), then file order.
+#
+#   type   = "local" | "huggingface"  ACL tier; MUST match the URL scheme
+#   url    = http:// for local (the host must be in scripts/init.lua's
+#            allow_endpoints), https:// for huggingface (--tls build)
+#   schema = "openai" (default; the only supported wire dialect —
+#            /v1/chat/completions + /v1/audio/transcriptions)
+#   model  = request model name
+#   api_key= bearer token; huggingface only, injected by the daemon, never
+#            visible to scripts (and rejected on a cleartext local provider)
 [llm]
-url = "http://127.0.0.1:8080/v1/chat/completions"
-model = "command"
+[[llm.provider]]
+type       = "local"
+url        = "http://127.0.0.1:8080/v1/chat/completions"
+model      = "command"
+timeout_ms = 30000
+
+# Hugging Face fallback (optional; requires a --tls build + [security]
+# external_egress). Reached only when the local entry above is UNREACHABLE. Its
+# ANSWER is stamped "external", and scripts/lib/route.lua will only route such an
+# answer into a script that opts in with rana.flags.EXTERNAL_EGRESS (off by
+# default), so a remote model can never reach, e.g., power.
+# [[llm.provider]]
+# type       = "huggingface"
+# url        = "https://api-inference.huggingface.co/models/<org>/<model>"
+# model      = "<org>/<model>"
+# api_key    = "hf_..."
+# timeout_ms = 15000
 
 # On-server STT for TalkCmd. The daemon decodes the audio to a WAV and hands it to
-# scripts/stt.pluto, which POSTs it to this endpoint and returns the transcript.
+# scripts/stt.pluto, which POSTs it to the first reachable provider here.
 [stt]
-url = "http://127.0.0.1:8080/v1/audio/transcriptions"
-model = "talk"
+[[stt.provider]]
+type       = "local"
+url        = "http://127.0.0.1:8080/v1/audio/transcriptions"
+model      = "talk"
 timeout_ms = 30000
+
+# Hugging Face fallback (see [llm] above; same gating).
+# [[stt.provider]]
+# type       = "huggingface"
+# url        = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
+# model      = "openai/whisper-large-v3"
+# api_key    = "hf_..."
+# timeout_ms = 15000
+
+# Fleet/incident policy. external_egress=false hard-disables EVERY huggingface
+# provider even when one is configured; the local endpoint allowlist in
+# scripts/init.lua is unaffected.
+[security]
+external_egress = true

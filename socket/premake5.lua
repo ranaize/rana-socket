@@ -37,6 +37,44 @@ includedirs({
 buildoptions({ "-DPLUTO_ETL_ENABLE" })
 libdirs({ ROOT .. "/vendor/pluto/src" })
 links({ "pluto", "pthread", "m", "dl" })
+
+-- ── optional TLS transport (huggingface providers) ─────────────────────
+-- Opt IN with the premake flag `--tls`: `premake5 gmake --tls` (premake scans
+-- _ARGV, so the flag may follow the action). Default is OFF: a no-TLS build is
+-- exactly today's capability and rejects every https:// URL in parse_url().
+-- When ON, rana.provider_post() is the ONLY path that can speak TLS; the
+-- generic rana.http_post stays http-only. See docs/security.md.
+newoption {
+	trigger = "tls",
+	category = "build",
+	description = "Enable the optional TLS (https) transport for Hugging Face providers (default off)",
+}
+newoption {
+	trigger = "tls-dynamic",
+	category = "build",
+	description = "Link OpenSSL dynamically instead of using the static archives (only meaningful with --tls)",
+}
+-- A valueless option is stored as ""; presence, not truthiness, is the flag.
+if _OPTIONS["tls"] ~= nil then
+	buildoptions({ "-DRANA_ENABLE_TLS" })
+	-- Prefer a STATIC link (no runtime libssl dependency, and it sidesteps the
+	-- trixie-build -> bookworm-run libssl ABI gap in the Docker image). Fall back
+	-- to the dynamic -lssl -lcrypto where the distro ships no static archives;
+	-- force that fallback with --tls-dynamic. find_lib_file() lives in
+	-- premake/helpers.lua (shared with future dependency builds).
+	local static = _OPTIONS["tls-dynamic"] == nil
+	local ssl_a    = static and find_lib_file("libssl.a")
+	local crypto_a = static and find_lib_file("libcrypto.a")
+	if ssl_a and crypto_a then
+		links({ ssl_a, crypto_a, "dl" })
+		-- Debian's static libcrypto may reference zlib; only add it when present.
+		if find_lib_file("libz.a") or find_lib_file("libz.so") then
+			links({ "z" })
+		end
+	else
+		links({ "ssl", "crypto" })
+	end
+end
 -- Locate libpluto.so ONLY next to the binary ($ORIGIN), so the daemon keeps
 -- resolving the .so regardless of where the repo is cloned/moved. The pluto
 -- stage also builds a static archive (libplutostatic.a); stage BOTH next to

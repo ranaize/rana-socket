@@ -12,8 +12,14 @@
 FROM debian:trixie-20260824-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential g++ cmake git curl ca-certificates \
+    build-essential g++ cmake git curl ca-certificates libssl-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Optional TLS transport for Hugging Face providers. OFF by default, so the
+# shipped image has exactly today's capabilities. Opt in with the `--tls`
+# premake flag carried on the predep build stage (`flags` support pending —
+# see docs/predep-flags-spec.md); libssl-dev above provides the static archives
+# premake prefers.
 
 # premake5 — generates the Makefiles used by predep's premake5 build stage.
 ARG PREMAKE_VER=5.0.0-beta2
@@ -77,7 +83,7 @@ FROM debian:bookworm-20260824-slim AS runtime
 # Everything else (ask/stt) runs in-process via Pluto; the other script backends
 # (lights/media/power/...) are deployment-specific and expected on the host.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates espeak-ng \
+    curl ca-certificates espeak-ng libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/socket/bin/Release/rana-socketd /usr/local/bin/rana-socketd

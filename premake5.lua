@@ -36,6 +36,9 @@ py_client_pkg   = ROOT .. "/client/py/rana_socket"
 -- Override with FLATBUFFERS_INCLUDE when your headers live elsewhere.
 fb_include      = os.getenv("FLATBUFFERS_INCLUDE") or "/usr/local/include"
 
+-- Shared build helpers (library probing, …) reused by every subproject.
+dofile(ROOT .. "/premake/helpers.lua")
+
 -- Regenerate the daemon's C++/Python bindings whenever the schema changes.
 -- Only the daemon writes into gen_dir; the CLI client regenerates its own
 -- copy into client_gen_dir so the two projects never write the same header

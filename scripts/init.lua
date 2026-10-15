@@ -44,6 +44,13 @@ rana.allow_endpoints({
 	{ scheme = "http", host = "localai", port = 8080 },
 })
 
+-- Hugging Face providers are NOT listed here. They are config-owned
+-- ([llm.provider]/[stt.provider] with type="huggingface") and reachable ONLY
+-- through the rana.provider_post() bridge. [security].external_egress=false
+-- disables the whole huggingface tier. Separately, an ANSWER from a huggingface
+-- provider may only be routed into scripts that opt in with
+-- rana.flags.EXTERNAL_EGRESS (see scripts/lib/route.lua; off by default).
+
 -- NOTE: no command/variant registration here. The registry is [commands.allowed]
 -- in TOML plus the scripts/ scan; each script self-describes via its meta table.
 -- Scripts also share reviewed helpers from scripts/lib/*.lua via

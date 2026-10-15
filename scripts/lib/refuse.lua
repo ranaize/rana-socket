@@ -1,0 +1,39 @@
+-- scripts/lib/refuse.lua
+--
+-- What the daemon does when it REFUSES a route: an answer from an EXTERNAL
+-- (huggingface) provider targeted a script that did not opt in via
+-- rana.flags.EXTERNAL_EGRESS (see lib/route.lua). Kept in one reviewed, isolated
+-- place because "what happens on refusal" is the trust boundary itself.
+--
+-- Three levels, most graceful first; route.lua walks them in order and applies
+-- the first whose capability is available:
+--
+--   reply  TTS a short reason to the user    (needs `speak` to have opted in)
+--   log    warn and drop the action          (no side effect)
+--   fail   SAFETY_GATE_FAILED, fail closed   (last resort)
+local M = {}
+
+-- Ordered, most graceful first.
+M.LEVELS = { "reply", "log", "fail" }
+
+-- A short, spoken-friendly reason. Never echoes the model's raw output (which is
+-- untrusted) back to the user or the logs.
+function M.reason(target)
+    return "I can't do " .. tostring(target) .. " from a remote answer."
+end
+
+-- Pick the level: prefer speaking to the user (only when the TTS sink itself
+-- opted in), else log, else fail closed. `can_log` defaults true.
+function M.level(can_reply, can_log)
+    if can_reply then return "reply" end
+    if can_log ~= false then return "log" end
+    return "fail"
+end
+
+-- Frozen view: the returned table is read-only, so nothing can repoint a level
+-- or the reason builder mid-run.
+return setmetatable({}, {
+    __index = M,
+    __newindex = function() error("lib.refuse is immutable", 2) end,
+    __metatable = false,
+})

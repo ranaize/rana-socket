@@ -112,9 +112,9 @@ bin/Release/rana-socket-client <addr> ask "what time is it"
 ```
 
 `ask` sends a `Command{key="ask", action="ask", target=text}` to the daemon. The
-daemon is the **only** caller of LocalAI: `scripts/ask.pluto` reads the endpoint
-from the `[llm]` config via `rana.get_llm_url()` and queries it with
-`rana.http_post`. The reply is parsed in Lua (never in C++) and routed with
+daemon is the **only** caller of LocalAI: `scripts/ask.pluto` walks the
+`[llm.provider]` chain (via `rana.providers` / `rana.provider_post`) and queries
+the first reachable entry. The reply is parsed in Lua (never in C++) and routed with
 `rana.dispatch` / `rana.respond`: intents this daemon owns run locally
 (`reply`→`speak`, `open`→`browser`, `toggle`→`lights`, `...`→`power`); intents
 owned by the peer daemon are handed back as a `FORWARD_TO_CLIENT` response. The
@@ -129,6 +129,36 @@ other script — by listing it in the registry:
 The daemon **never parses JSON in C++** and no shell hop is involved: the LLM
 call, JSON decode, and intent routing all live in `scripts/ask.pluto` and its
 reviewed helpers under `scripts/lib/`.
+
+### Cloud fallback (optional, Hugging Face)
+
+Each hop is an ordered **provider chain** in TOML (`[[llm.provider]]` /
+`[[stt.provider]]`). Providers are tried top to bottom and only a **transport
+failure/timeout** of one advances to the next; a live 4xx/5xx is the upstream's
+own answer and stops the chain. With no `order` key the default is local-first
+(local = 100, huggingface = 200), so a local entry is always tried before a
+Hugging Face one. The Hugging Face tier is deny-by-default at every layer:
+
+- **Build:** opt in with the premake `--tls` flag (`premake5 gmake --tls`, or the
+  build stage's `flags` when driving the build through predep). Without it there
+  is no TLS code and every `https://` URL is rejected. Static OpenSSL is
+  preferred automatically; force dynamic with `--tls-dynamic`.
+- **Config:** add the `type = "huggingface"` entry (`https` url + `api_key`) and,
+  if you want a kill switch, `[security].external_egress`. An `api_key` on a
+  `local` provider is rejected at load (it would travel in cleartext), and a
+  `type` that disagrees with the URL scheme is rejected too.
+- **Routing (inbound):** an answer that came from a huggingface provider is
+  stamped external and may only be *acted on* by a script that opts in with
+  `rana.flags.EXTERNAL_EGRESS` — **off by default**, so a remote model can reach
+  nothing until the operator opts scripts in (including `speak`, if replies
+  should be spoken). A refused route speaks/logs via `scripts/lib/refuse.lua`;
+  it is never dispatched and never relayed to the peer. A caller can still opt
+  one request out of the cloud entirely with `{ cloud = false }`.
+
+The destination and the bearer token are owned by the bridge — scripts call
+`rana.providers(kind)` to read the ordered list and
+`rana.provider_post("llm"|"stt", index, payload)`, and never see the URL they
+dial or the secret. See `docs/security.md` for the full egress model.
 
 The response is framed the same way on the wire (4-byte big-endian length
 header) and the client prints the daemon's `Response` status/message:
@@ -158,3 +188,26 @@ Key `[daemon]` options (all optional, with defaults):
 Command entries live under `[commands.*]` and are dispatched by their union
 type; see `rana-deploy/config/client.toml` for examples and
 `schema/command.fbs` for the command vocabulary.
+
+`[llm]` / `[stt]` hold an ordered provider chain. Each `[[llm.provider]]` /
+`[[stt.provider]]` entry:
+
+| key          | default      | meaning                                              |
+|--------------|--------------|------------------------------------------------------|
+| `type`       | *(from url)* | `"local"` (http) or `"huggingface"` (https); must match the scheme |
+| `url`        | *(required)* | request endpoint                                     |
+| `model`      | *(empty)*    | request model name                                   |
+| `schema`     | `"openai"`   | wire dialect; only `"openai"` is supported           |
+| `api_key`    | *(empty)*    | bearer token; **huggingface only** (rejected on `local`) |
+| `timeout_ms` | `15000`      | bounds this provider's single attempt                |
+| `order`      | *(tier)*     | sort key; omitted ⇒ local `100`, huggingface `200`   |
+| `name`       | *(empty)*    | optional log label                                   |
+
+`schema = "openai"` means `/v1/chat/completions` for `[llm]` and
+`/v1/audio/transcriptions` for `[stt]`.
+
+`[security]`:
+
+| key               | default | meaning                                                |
+|-------------------|---------|--------------------------------------------------------|
+| `external_egress` | `true`  | `false` hard-disables every huggingface provider (kill switch) |

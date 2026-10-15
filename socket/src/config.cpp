@@ -1,9 +1,11 @@
 #include "config.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <map>
 #include <set>
+#include <vector>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -18,12 +20,11 @@ const std::set<std::string> kDaemonKeys = {
     "bind_address", "port", "allowed_ips", "scripts_dir",
 };
 
-std::set<std::string> allowed_llm_keys() {
-    return {"url", "model"};
-}
+// [llm]/[stt] hold a single [[llm.provider]] / [[stt.provider]] array.
+const std::set<std::string> kHopKeys = {"provider"};
 
-std::set<std::string> allowed_stt_keys() {
-    return {"url", "model", "timeout_ms"};
+std::set<std::string> allowed_security_keys() {
+    return {"external_egress"};
 }
 
 std::string unknown_key(const toml::table& table, const std::set<std::string>& allowed,
@@ -34,6 +35,108 @@ std::string unknown_key(const toml::table& table, const std::set<std::string>& a
         }
     }
     return {};
+}
+
+// One [[llm.provider]] / [[stt.provider]] entry. Strict: an unknown key, a missing
+// url, a `type` that disagrees with the URL scheme, a non-openai schema, or an
+// api_key on a cleartext (local) provider all reject the whole config.
+bool parse_provider(const toml::table& t, const std::string& ctx,
+                    ProviderConfig& out, std::string& err) {
+    static const std::set<std::string> kKeys = {
+        "type", "url", "model", "schema", "api_key", "timeout_ms", "order", "name",
+    };
+    if (const std::string e = unknown_key(t, kKeys, ctx); !e.empty()) {
+        err = e;
+        return false;
+    }
+    if (auto v = t.at_path("url").value<std::string>()) out.url = *v;
+    if (auto v = t.at_path("model").value<std::string>()) out.model = *v;
+    if (auto v = t.at_path("schema").value<std::string>()) out.schema = *v;
+    if (auto v = t.at_path("api_key").value<std::string>()) out.api_key = *v;
+    if (auto v = t.at_path("name").value<std::string>()) out.name = *v;
+    if (auto v = t.at_path("timeout_ms").value<int64_t>()) {
+        if (*v > 0) out.timeout_ms = static_cast<uint32_t>(*v);
+    }
+    if (auto v = t.at_path("order").value<int64_t>()) {
+        if (*v > 0) out.order = static_cast<int>(*v);
+    }
+
+    if (out.url.empty()) {
+        err = ctx + ": 'url' is required";
+        return false;
+    }
+    const bool https = out.url.rfind("https://", 0) == 0;
+    const bool http = out.url.rfind("http://", 0) == 0;
+    if (!http && !https) {
+        err = ctx + ": url must start with http:// or https://";
+        return false;
+    }
+    // The URL scheme is the source of truth for the ACL tier; an explicit `type`
+    // is only allowed to agree with it. That keeps a token-bearing https call from
+    // being relabelled "local" to slip past the cloud gates.
+    const std::string infer = https ? "huggingface" : "local";
+    if (auto v = t.at_path("type").value<std::string>()) out.type = *v;
+    if (out.type.empty()) out.type = infer;
+    if (out.type != "local" && out.type != "huggingface") {
+        err = ctx + ": type must be \"local\" or \"huggingface\"";
+        return false;
+    }
+    if (out.type != infer) {
+        err = ctx + ": type \"" + out.type + "\" does not match the " +
+              (https ? "https" : "http") + " url";
+        return false;
+    }
+    if (out.type == "local" && !out.api_key.empty()) {
+        err = ctx + ": api_key is only allowed on a huggingface provider "
+              "(a bearer token must never travel in cleartext)";
+        return false;
+    }
+    if (out.schema != "openai") {
+        err = ctx + ": schema \"" + out.schema + "\" is not supported (only \"openai\")";
+        return false;
+    }
+    return true;
+}
+
+// Parse [llm]/[stt] into an ordered provider chain.
+bool parse_providers(const toml::table& section, const std::string& name,
+                     std::vector<ProviderConfig>& out, std::string& err) {
+    if (const std::string e = unknown_key(section, kHopKeys, "[" + name + "]"); !e.empty()) {
+        err = e;
+        return false;
+    }
+    const auto* arr = section.at_path("provider").as_array();
+    if (!arr) {
+        if (section.contains("provider")) {
+            err = "[" + name + ".provider] must be an array of tables";
+            return false;
+        }
+        return true;  // no providers configured for this hop
+    }
+    int idx = 0;
+    for (const auto& el : *arr) {
+        ++idx;
+        const auto* t = el.as_table();
+        const std::string ctx = "[" + name + ".provider] #" + std::to_string(idx);
+        if (!t) {
+            err = ctx + " must be a table";
+            return false;
+        }
+        ProviderConfig p;
+        if (!parse_provider(*t, ctx, p, err)) return false;
+        out.push_back(std::move(p));
+    }
+    // Stable sort by order (0 => tier default: local before huggingface), then
+    // file order. With no `order` at all the chain is therefore local-then-cloud.
+    std::stable_sort(out.begin(), out.end(),
+                     [](const ProviderConfig& a, const ProviderConfig& b) {
+        auto key = [](const ProviderConfig& p) {
+            if (p.order > 0) return p.order;
+            return p.type == "huggingface" ? 200 : 100;
+        };
+        return key(a) < key(b);
+    });
+    return true;
 }
 
 // Directory of the running daemon binary (Linux: /proc/self/exe).
@@ -121,7 +224,7 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
 
         for (const auto& [key, value] : tbl) {
             const std::string k(key);
-            if (k != "daemon" && k != "llm" && k != "stt" && k != "commands") {
+            if (k != "daemon" && k != "llm" && k != "stt" && k != "security" && k != "commands") {
                 err = "unknown top-level key '" + k + "'";
                 return false;
             }
@@ -148,23 +251,20 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
         }
 
         if (const auto* llm = tbl["llm"].as_table()) {
-            if (const std::string e = unknown_key(*llm, allowed_llm_keys(), "[llm]"); !e.empty()) {
-                err = e;
-                return false;
-            }
-            if (auto v = llm->at_path("url").value<std::string>()) out.llm.url = *v;
-            if (auto v = llm->at_path("model").value<std::string>()) out.llm.model = *v;
+            if (!parse_providers(*llm, "llm", out.llm.providers, err)) return false;
         }
 
         if (const auto* stt = tbl["stt"].as_table()) {
-            if (const std::string e = unknown_key(*stt, allowed_stt_keys(), "[stt]"); !e.empty()) {
+            if (!parse_providers(*stt, "stt", out.stt.providers, err)) return false;
+        }
+
+        if (const auto* security = tbl["security"].as_table()) {
+            if (const std::string e = unknown_key(*security, allowed_security_keys(), "[security]"); !e.empty()) {
                 err = e;
                 return false;
             }
-            if (auto v = stt->at_path("url").value<std::string>()) out.stt.url = *v;
-            if (auto v = stt->at_path("model").value<std::string>()) out.stt.model = *v;
-            if (auto v = stt->at_path("timeout_ms").value<int64_t>()) {
-                out.stt.timeout_ms = static_cast<uint32_t>(*v);
+            if (auto v = security->at_path("external_egress").value<bool>()) {
+                out.security.external_egress = *v;
             }
         }
 

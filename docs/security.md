@@ -67,13 +67,73 @@ All privileged actions go through the `rana.*` C bridge and are gated:
 - `rana.dispatch(...)` / `rana.respond(...)` — only `[commands.allowed]` keys.
 - `rana.http_post(...)` — only hosts present in the endpoint allowlist.
 - `rana.audio.decode_to_wav(...)` — in-process codec; no shell, no network.
-- `rana.http_post` uses our own `http_do` (getaddrinfo + plaintext HTTP/1.1 with
-  send/recv deadlines) and only talks to allowlisted hosts; it is **not** Pluto's
-  `http` library. **TLS is not implemented**: `https` URLs are rejected at the
-  scheme check rather than silently connecting in the clear — terminate TLS in a
-  local proxy if you need it.
+- `rana.script_metas()` — read-only startup metadata per script (`description`,
+  `keywords`, `danger`, and the `external_egress` opt-in). Drives the fuzzy
+  pre-router and the inbound routing gate below; carries no secrets.
+- `rana.provider_post(kind, index, ...)` — the **only** TLS path; `kind`
+  (`"llm"`/`"stt"`) and `index` select a config-owned `[[llm.provider]]` /
+  `[[stt.provider]]` entry (scripts never name the host). See "Outbound egress
+  tiers" below.
+- `rana.http_post` uses our own `http_do` (getaddrinfo + HTTP/1.1 with send/recv
+  deadlines) and only talks to allowlisted hosts; it is **not** Pluto's `http`
+  library. It returns `(ok, body, status)`; `status == 0` marks a transport
+  failure (the only case on which a provider chain advances). In the default
+  (no-TLS) build `https` URLs are rejected at the scheme check rather than
+  silently connecting in the clear; TLS exists only behind the opt-in build flag
+  and only for `rana.provider_post` (below).
 
-### 4. Script registration
+### 4. Outbound egress tiers
+Each hop is an ordered **provider chain** (`[[llm.provider]]` / `[[stt.provider]]`).
+Providers are tried in order; a provider answers when it returns 2xx (or a live
+4xx/5xx — the upstream's own answer), and only a **transport failure/timeout**
+(status 0) advances to the next entry. The URL scheme decides the tier, and the
+optional `type` field must agree with it:
+
+- **Local tier** — `type = "local"` (`http://`). The host must already be listed
+  in `rana.allow_endpoints(...)` in `scripts/init.lua`; reached via
+  `rana.http_post`/`rana.provider_post`. This is the LocalAI/Whisper path.
+- **Hugging Face tier** — `type = "huggingface"` (`https://`), reached **only**
+  via `rana.provider_post`. Scripts cannot add to it or name its host; generic
+  `rana.http_post` can never reach it.
+
+Outbound to the Hugging Face tier is deny-by-default at every layer:
+1. **Build** — off unless the daemon is built with the `--tls` premake flag
+   (`RANA_ENABLE_TLS`). A no-TLS build has **no** OpenSSL linkage, compiles no
+   TLS code, and rejects every `https` URL. Ablation, not policy. Static OpenSSL
+   is preferred automatically where the distro ships `libssl.a`/`libcrypto.a`;
+   force the dynamic `-lssl -lcrypto` path with `--tls-dynamic`.
+2. **Config** — a `huggingface` provider needs an `https` url and its `api_key`
+   (an `api_key` on a `local` provider is rejected outright, so the token cannot
+   leak over cleartext; a `type`/scheme mismatch is rejected at load).
+3. **Policy** — `[security].external_egress = false` hard-disables the tier even
+   when configured (fleet/incident kill switch).
+4. **Per call** — the calling hop may pass `{ cloud = false }` to skip every
+   huggingface provider for one request (e.g. not shipping a particular
+   transcript/recording to a third party).
+
+The bearer token (`api_key`) is **injected by the C bridge** as
+`Authorization: Bearer …`; it is never returned by any `rana.*` getter, never
+logged, and any script-supplied `Authorization` on a huggingface call is
+discarded. TLS verification is mandatory: peer certificate **and** hostname are
+checked against the request host, with TLS 1.2 minimum.
+
+### 4a. Inbound routing gate (answers from a huggingface provider)
+Egress is only half the risk: a remote model's *answer* is untrusted (it can be
+steered by whatever the microphone picked up), so acting on it is gated too.
+- An answer that came from a `type = "huggingface"` provider is stamped
+  `external` by `lib/llm.lua` from the provider that **answered** — never from
+  the reply text — so the model cannot spoof it.
+- `scripts/lib/route.lua` then refuses to dispatch or relay an external answer
+  to any script that has not opted in with `rana.flags.EXTERNAL_EGRESS` in its
+  `meta.flags` (read back via `rana.script_metas().external_egress`). **Off by
+  default**: a remote model can reach nothing until the operator opts scripts in
+  — including `speak` (itself a script), if replies should be spoken.
+- A refusal never executes and never reaches the peer. `scripts/lib/refuse.lua`
+  owns the ladder: speak a short reason (only if `speak` opted in), else log and
+  drop, else `SAFETY_GATE_FAILED`. It is isolated and read-only.
+- Local (non-external) answers are unaffected — the local model stays trusted.
+
+### 5. Script registration
 - The daemon scans `scripts/*.pluto` at startup and reads each script's `meta`
   (name, description, actions, params, timeout, examples, flags). Scripts are
   self-describing and must declare what they do; `init.lua` only registers the

@@ -38,6 +38,11 @@ targets = ["libpluto.so"]
 jobs = 0
 variables = { MYCFLAGS = "-DPLUTO_DISABLE_COMPILED -DPLUTO_NO_BINARIES -DPLUTO_DISABLE_HTTP_COMPLETELY -DPLUTO_ETL_ENABLE -DPLUTO_ILP_ENABLE", SYSLIBS = "-ldl -lresolv" }
 
+# To ship the optional TLS transport (huggingface providers), pass the premake
+# `--tls` flag through this stage once your predep supports the stage `flags`
+# option (see docs/predep-flags-spec.md):
+#   flags = ["--tls"]
+# Omit it for the default no-TLS build (byte-for-byte today's capabilities).
 [[stages]]
 name = "build"
 type = "premake5"

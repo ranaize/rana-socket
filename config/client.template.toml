@@ -28,15 +28,7 @@ socket_permissions = 0o600
 "lights"   = true
 "media"    = true
 
-# The daemon is the ONLY LocalAI caller. The ask hop (scripts/ask.pluto) reads
-# these to build its request.
-[llm]
-url = "http://127.0.0.1:8080/v1/chat/completions"
-model = "command"
-
-# On-host STT for TalkCmd. The daemon decodes the audio to a WAV and hands it to
-# scripts/stt.pluto, which POSTs it to this endpoint and returns the transcript.
-[stt]
-url = "http://127.0.0.1:8080/v1/audio/transcriptions"
-model = "talk"
-timeout_ms = 30000
+# LLM/STT provider chains and the [security].external_egress switch live in
+# server.template.toml: this daemon runs no ask/talk hop, so it has no provider
+# chains to configure. Keep this file's [commands.allowed] to the local device
+# commands below.

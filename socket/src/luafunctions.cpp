@@ -24,6 +24,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef RANA_ENABLE_TLS
+// Provider-chain transport (TLS gated by the --tls premake flag). This is the
+// ONLY place TLS is spoken; generic rana.http_post remains http-only and can
+// never reach a huggingface provider (see rana_provider_post).
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#endif
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -520,10 +529,23 @@ bool parse_int(const std::string& s, long& out, int base = 10) {
     return true;
 }
 
+int default_port_for(const std::string& scheme) { return scheme == "https" ? 443 : 80; }
+
 bool parse_url(const std::string& raw, Url& u, std::string& err) {
     size_t sp = raw.find("://");
     if (sp == std::string::npos) { err = "missing scheme"; return false; }
     u.scheme = raw.substr(0, sp);
+    if (u.scheme == "https") {
+#ifndef RANA_ENABLE_TLS
+        // Deny-by-default: a build without RANA_ENABLE_TLS cannot speak TLS, so
+        // reject https rather than silently connecting in the clear.
+        err = "https requires a TLS-enabled build (rebuild with --tls)";
+        return false;
+#endif
+    } else if (u.scheme != "http") {
+        err = "unsupported scheme (http only)";
+        return false;
+    }
     std::string rest = raw.substr(sp + 3);
     size_t slash = rest.find('/');
     std::string authority = (slash == std::string::npos) ? rest : rest.substr(0, slash);
@@ -531,7 +553,7 @@ bool parse_url(const std::string& raw, Url& u, std::string& err) {
     size_t colon = authority.find(':');
     if (colon == std::string::npos) {
         u.host = authority;
-        u.port = 80;
+        u.port = default_port_for(u.scheme);
     } else {
         u.host = authority.substr(0, colon);
         long p = 0;
@@ -541,9 +563,6 @@ bool parse_url(const std::string& raw, Url& u, std::string& err) {
         }
         u.port = static_cast<int>(p);
     }
-    // http_do speaks plaintext HTTP only; do not silently accept https and then
-    // connect in the clear. TLS is a future extension.
-    if (u.scheme != "http") { err = "unsupported scheme (http only)"; return false; }
     if (u.host.empty()) { err = "missing host"; return false; }
     return true;
 }
@@ -557,6 +576,87 @@ void set_socket_timeout(int fd, uint32_t timeout_ms) {
     tv.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000) * 1000);
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+// ── Transport: plaintext or TLS ──────────────────────────────────────
+// One HTTP connection. Plaintext uses send/recv; with RANA_ENABLE_TLS a
+// https:// URL wraps the fd in OpenSSL with MANDATORY certificate + hostname
+// verification. Every failure is reported by return value — never an exception
+// (this runs inside a lua_CFunction). Only rana.provider_post() ever builds a TLS
+// connection; generic rana.http_post cannot reach a huggingface provider.
+struct Conn {
+    int fd = -1;
+    bool tls = false;
+#ifdef RANA_ENABLE_TLS
+    SSL* ssl = nullptr;
+#endif
+};
+
+#ifdef RANA_ENABLE_TLS
+// Process-wide client context (the daemon is single-threaded). Created lazily on
+// the first https request. Returns nullptr if OpenSSL could not be set up.
+SSL_CTX* tls_ctx() {
+    static SSL_CTX* ctx = []() -> SSL_CTX* {
+        SSL_CTX* c = SSL_CTX_new(TLS_client_method());
+        if (!c) return nullptr;
+        SSL_CTX_set_verify(c, SSL_VERIFY_PEER, nullptr);
+        SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
+        if (SSL_CTX_set_default_verify_paths(c) != 1) {
+            SSL_CTX_free(c);
+            return nullptr;
+        }
+        return c;
+    }();
+    return ctx;
+}
+#endif
+
+// Wrap an already-connected fd in TLS when scheme == "https". Returns false (and
+// leaves the caller to close the fd) on any handshake/verification failure.
+bool conn_open(Conn& c, const std::string& scheme, const std::string& host) {
+    c.tls = false;
+    if (scheme != "https") return true;
+#ifdef RANA_ENABLE_TLS
+    SSL_CTX* ctx = tls_ctx();
+    if (!ctx) return false;
+    c.ssl = SSL_new(ctx);
+    if (!c.ssl) return false;
+    SSL_set_fd(c.ssl, c.fd);
+    // SNI + hostname verification: without these, a valid cert for ANY host
+    // would be accepted (a silent MITM).
+    SSL_set_tlsext_host_name(c.ssl, host.c_str());
+    SSL_set1_host(c.ssl, host.c_str());
+    if (SSL_connect(c.ssl) != 1) return false;
+    if (SSL_get_verify_result(c.ssl) != X509_V_OK) return false;
+    c.tls = true;
+    return true;
+#else
+    (void)host;
+    return false;
+#endif
+}
+
+ssize_t conn_send(Conn& c, const void* buf, size_t n) {
+#ifdef RANA_ENABLE_TLS
+    if (c.tls) return SSL_write(c.ssl, buf, static_cast<int>(n));
+#endif
+    return ::send(c.fd, buf, n, 0);
+}
+
+ssize_t conn_recv(Conn& c, void* buf, size_t n) {
+#ifdef RANA_ENABLE_TLS
+    if (c.tls) return SSL_read(c.ssl, buf, static_cast<int>(n));
+#endif
+    return ::recv(c.fd, buf, n, 0);
+}
+
+void conn_close(Conn& c) {
+#ifdef RANA_ENABLE_TLS
+    // Free the SSL object whenever it was allocated, even if the handshake
+    // failed before c.tls was set (otherwise SSL_new's object leaks).
+    if (c.ssl) { SSL_shutdown(c.ssl); SSL_free(c.ssl); c.ssl = nullptr; }
+#endif
+    if (c.fd >= 0) { ::close(c.fd); c.fd = -1; }
 }
 
 // Returns (status_code, body). On transport failure status is 0.
@@ -585,21 +685,26 @@ std::pair<int, std::string> http_do(const std::string& method, const std::string
     if (getaddrinfo(u.host.c_str(), std::to_string(u.port).c_str(), &hints, &res) != 0 || !res)
         return {0, "dns failure"};
 
-    int fd = -1;
+    Conn conn;
+    bool tls_failed = false;
     for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
         set_socket_timeout(fd, timeout_ms);
-        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
-        ::close(fd);
-        fd = -1;
+        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) { ::close(fd); continue; }
+        conn.fd = fd;
+        if (conn_open(conn, u.scheme, u.host)) break;
+        tls_failed = true;
+        conn_close(conn);
     }
     freeaddrinfo(res);
-    if (fd < 0) return {0, "connect failed"};
+    if (conn.fd < 0) return {0, tls_failed ? "tls handshake failed" : "connect failed"};
 
     std::string req = method + " " + u.path + " HTTP/1.1\r\n";
-    // Host carries the port when it is not the scheme default.
-    req += "Host: " + u.host + (u.port == 80 ? "" : ":" + std::to_string(u.port)) + "\r\n";
+    // Host carries the port when it is not the scheme default (80 for http,
+    // 443 for https).
+    req += "Host: " + u.host +
+           (u.port == default_port_for(u.scheme) ? "" : ":" + std::to_string(u.port)) + "\r\n";
     req += "Connection: close\r\n";
     if (headers.find("Content-Type") == headers.end())
         req += "Content-Type: application/json\r\n";
@@ -610,19 +715,19 @@ std::pair<int, std::string> http_do(const std::string& method, const std::string
 
     size_t sent = 0;
     while (sent < req.size()) {
-        ssize_t w = ::send(fd, req.data() + sent, req.size() - sent, 0);
-        if (w <= 0) { ::close(fd); return {0, "send failed"}; }
+        ssize_t w = conn_send(conn, req.data() + sent, req.size() - sent);
+        if (w <= 0) { conn_close(conn); return {0, "send failed"}; }
         sent += static_cast<size_t>(w);
     }
 
     std::string resp;
     char buf[4096];
     for (;;) {
-        ssize_t r = ::recv(fd, buf, sizeof(buf), 0);
+        ssize_t r = conn_recv(conn, buf, sizeof(buf));
         if (r <= 0) break;
         resp.append(buf, static_cast<size_t>(r));
     }
-    ::close(fd);
+    conn_close(conn);
 
     auto header_end = resp.find("\r\n\r\n");
     if (header_end == std::string::npos) return {0, "bad response"};
@@ -759,6 +864,9 @@ std::set<ScriptFlag> table_to_flags(lua_State* L, int idx) {
                 case static_cast<lua_Integer>(ScriptFlag::LongIdle):
                     s.insert(ScriptFlag::LongIdle);
                     break;
+                case static_cast<lua_Integer>(ScriptFlag::ExternalEgress):
+                    s.insert(ScriptFlag::ExternalEgress);
+                    break;
                 default:
                     rana::log_msg("luafunctions", "unknown script flag %lld ignored",
                                   static_cast<long long>(v));
@@ -867,7 +975,96 @@ int rana_http_post(lua_State* L) {
                                   rt->current_etl_timeout());
     lua_pushboolean(L, status >= 200 && status < 300);
     lua_pushlstring(L, resp.data(), resp.size());
-    return 2;
+    // Third value: the HTTP status (0 == transport failure). Callers that only
+    // care about success ignore it; the provider chain uses it to distinguish
+    // "unreachable" (0, advance to the next provider) from a live 4xx/5xx (the
+    // upstream's own answer, which stops the chain).
+    lua_pushinteger(L, status);
+    return 3;
+}
+
+// rana.providers(kind) -> { {type, schema, model, name}, ... }
+//
+// The ordered provider chain for `kind` ("llm"/"stt"). Only non-secret fields are
+// exposed: the URL and any bearer token stay in the C bridge. An empty table is
+// returned for an unknown kind or a hop with no configured providers.
+int rana_providers(lua_State* L) {
+    LuaRuntime* rt = rt_from_up(L);
+    const char* kind = luaL_checkstring(L, 1);
+    const auto* provs = rt->providers(kind);
+    lua_newtable(L);
+    if (!provs) return 1;
+    int i = 0;
+    for (const auto& p : *provs) {
+        ++i;
+        lua_newtable(L);
+        lua_pushstring(L, p.type.c_str());   lua_setfield(L, -2, "type");
+        lua_pushstring(L, p.schema.c_str()); lua_setfield(L, -2, "schema");
+        lua_pushstring(L, p.model.c_str());  lua_setfield(L, -2, "model");
+        lua_pushstring(L, p.name.c_str());   lua_setfield(L, -2, "name");
+        lua_rawseti(L, -2, i);
+    }
+    return 1;
+}
+
+// rana.provider_post(kind, index, payload [, headers]) -> ok, body, status
+//
+// POST to the index-th (1-based) provider of the `kind` chain — the ONLY bridge
+// entry point that speaks TLS. The destination and bearer token come from CONFIG,
+// never from Lua. A "huggingface" provider is gated three ways: built with
+// RANA_ENABLE_TLS, [security].external_egress true, and the URL is https (routing
+// an external answer back into a script is a separate, inbound gate — see
+// rana_script_metas' external_egress). A "local" provider may only dial a host
+// already in the scripts/init.lua endpoint allowlist. The third value is the HTTP
+// status (0 == transport failure or a gate refusal), matching rana.http_post.
+int rana_provider_post(lua_State* L) {
+    LuaRuntime* rt = rt_from_up(L);
+    const std::string kind = luaL_checkstring(L, 1);
+    const int index = static_cast<int>(luaL_checkinteger(L, 2));
+
+    auto fail = [&](const std::string& reason) -> int {
+        lua_pushboolean(L, false);
+        lua_pushlstring(L, reason.data(), reason.size());
+        lua_pushinteger(L, 0);
+        return 3;
+    };
+
+    const auto* provs = rt->providers(kind);
+    if (!provs || index < 1 || static_cast<size_t>(index) > provs->size()) {
+        return fail("bad_args");
+    }
+    const std::string reason = rt->provider_unavailable_reason(kind, index);
+    if (!reason.empty()) return fail(reason);
+    const ProviderConfig& p = (*provs)[index - 1];
+
+    std::string body_s;
+    if (lua_istable(L, 3)) {
+        json::encode(L, 3, body_s);
+    } else {
+        size_t blen = 0; const char* b = luaL_checklstring(L, 3, &blen); body_s.assign(b, blen);
+    }
+    std::map<std::string, std::string> headers = table_to_map(L, 4);
+
+    std::vector<LuaRuntime::Endpoint> allow;
+    if (p.type == "huggingface") {
+        // The bridge owns Authorization on a cloud call: drop any script-supplied
+        // one so a script cannot smuggle a different credential.
+        headers.erase("Authorization");
+        headers["Authorization"] = "Bearer " + p.api_key;
+        // Restrict the dial to this exact configured endpoint.
+        Url u; std::string e;
+        if (!parse_url(p.url, u, e)) return fail(e.empty() ? "bad url" : e);
+        allow.push_back({u.scheme, u.host, u.port});
+    } else {
+        // A local provider may only reach a host the sandbox already allowlisted.
+        allow = rt->endpoints();
+    }
+
+    auto [status, resp] = http_do("POST", p.url, headers, body_s, allow, p.timeout_ms);
+    lua_pushboolean(L, status >= 200 && status < 300);
+    lua_pushlstring(L, resp.data(), resp.size());
+    lua_pushinteger(L, status);
+    return 3;
 }
 
 int rana_decode_json(lua_State* L) {
@@ -989,30 +1186,6 @@ int rana_respond(lua_State* L) {
     return 0;
 }
 
-int rana_get_llm_url(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    lua_pushstring(L, rt->config()->llm.url.c_str());
-    return 1;
-}
-
-int rana_get_llm_model(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    lua_pushstring(L, rt->config()->llm.model.c_str());
-    return 1;
-}
-
-int rana_get_stt_url(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    lua_pushstring(L, rt->config()->stt.url.c_str());
-    return 1;
-}
-
-int rana_get_stt_model(lua_State* L) {
-    LuaRuntime* rt = rt_from_up(L);
-    lua_pushstring(L, rt->config()->stt.model.c_str());
-    return 1;
-}
-
 int rana_allow_binaries(lua_State* L) {
     LuaRuntime* rt = rt_from_up(L);
     std::map<std::string, LuaRuntime::BinaryEntry> m;
@@ -1067,6 +1240,8 @@ int rana_script_metas(lua_State* L) {
         for (const auto& kw : m.keywords) { lua_pushstring(L, kw.c_str()); lua_rawseti(L, -2, i++); }
         lua_setfield(L, -2, "keywords");
         lua_pushboolean(L, m.danger); lua_setfield(L, -2, "danger");
+        lua_pushboolean(L, m.flags.count(ScriptFlag::ExternalEgress) > 0);
+        lua_setfield(L, -2, "external_egress");
         lua_setfield(L, -2, key.c_str());
     }
     return 1;
@@ -1164,16 +1339,14 @@ int rana_guard(lua_State* L) {
 const luaL_Reg kRanaLib[] = {
     {"spawn", rana_guard<rana_spawn>},
     {"http_post", rana_guard<rana_http_post>},
+    {"providers", rana_guard<rana_providers>},
+    {"provider_post", rana_guard<rana_provider_post>},
     {"json_decode", rana_guard<rana_decode_json>},
     {"get_system_prompt", rana_guard<rana_get_system_prompt>},
     {"dispatch", rana_guard<rana_dispatch>},
     {"has_script", rana_guard<rana_has_script>},
     {"script_metas", rana_guard<rana_script_metas>},
     {"respond", rana_guard<rana_respond>},
-    {"get_llm_url", rana_guard<rana_get_llm_url>},
-    {"get_llm_model", rana_guard<rana_get_llm_model>},
-    {"get_stt_url", rana_guard<rana_get_stt_url>},
-    {"get_stt_model", rana_guard<rana_get_stt_model>},
     {"allow_binaries", rana_guard<rana_allow_binaries>},
     {"allow_endpoints", rana_guard<rana_allow_endpoints>},
     {"log", rana_guard<rana_log>},
@@ -1210,9 +1383,13 @@ void luaopen_rana(lua_State* L, LuaRuntime* rt) {
     // rana.flags: capability flag constants. Scripts opt in via
     // M.meta.flags = { rana.flags.LONG_IDLE } — the integer is the contract,
     // so a typo surfaces as an empty allow-flags set, not a silent privilege.
+    // EXTERNAL_EGRESS is an INBOUND opt-in (may an external answer reach me);
+    // it is not needed to dial a huggingface provider.
     lua_newtable(L);
     lua_pushinteger(L, static_cast<int>(ScriptFlag::LongIdle));
     lua_setfield(L, -2, "LONG_IDLE");
+    lua_pushinteger(L, static_cast<int>(ScriptFlag::ExternalEgress));
+    lua_setfield(L, -2, "EXTERNAL_EGRESS");
     lua_setfield(L, -2, "flags");
 
     // Make require("rana") resolve to this table.
@@ -1632,5 +1809,34 @@ const std::map<std::string, LuaRuntime::BinaryEntry>& LuaRuntime::binaries() con
 const std::vector<LuaRuntime::Endpoint>& LuaRuntime::endpoints() const { return endpoints_; }
 uint32_t LuaRuntime::current_timeout() const { return current_timeout_; }
 uint32_t LuaRuntime::current_etl_timeout() const { return current_etl_timeout_; }
+
+// ── Provider chains ([llm.provider]/[stt.provider]) ──────────────────
+
+bool LuaRuntime::tls_built() {
+#ifdef RANA_ENABLE_TLS
+    return true;
+#else
+    return false;
+#endif
+}
+
+const std::vector<ProviderConfig>* LuaRuntime::providers(const std::string& kind) const {
+    if (!cfg_) return nullptr;
+    if (kind == "llm") return &cfg_->llm.providers;
+    if (kind == "stt") return &cfg_->stt.providers;
+    return nullptr;
+}
+
+std::string LuaRuntime::provider_unavailable_reason(const std::string& kind, int index) const {
+    const auto* provs = providers(kind);
+    if (!provs || index < 1 || static_cast<size_t>(index) > provs->size()) return "bad_args";
+    const ProviderConfig& p = (*provs)[index - 1];
+    if (p.type == "huggingface") {
+        if (!tls_built()) return "tls_not_built";
+        if (cfg_ && !cfg_->security.external_egress) return "disabled";
+    }
+    // A local provider is additionally checked against endpoints_ inside http_do.
+    return "";
+}
 
 }  // namespace rana

@@ -2,6 +2,18 @@
 --
 -- The LLM ask hop: fuzzy-route first, otherwise call the configured model and
 -- coerce its reply into an {action, payload} intent.
+--
+-- Provider chain: [llm.provider] entries are tried in order. Only a TRANSPORT
+-- failure (status 0 — unreachable/timeout, or a huggingface entry whose gates
+-- refuse it) advances to the next provider; a live 4xx/5xx is the upstream's own
+-- answer and stops the chain. An https (huggingface) entry is usable only from a
+-- daemon built with TLS (RANA_ENABLE_TLS) and when [security].external_egress is
+-- true. The bridge (rana.provider_post) owns the destination and the bearer
+-- token; the script never sees the URL it dials or the secret.
+--
+-- When a huggingface entry ANSWERS, the returned intent is stamped
+-- `external = true` so lib/route.lua can restrict which scripts it may reach
+-- (see rana.flags.EXTERNAL_EGRESS).
 local rana = require("rana")
 local fuzzy = require("lib.fuzzy")
 
@@ -51,40 +63,78 @@ function M.parse_action(content)
     return "reply", t
 end
 
--- ask(text) -> {action, payload}. Fuzzy pre-route skips the LLM pass entirely
--- for a confident lexical match; on any failure the intent degrades to a spoken
--- "reply" rather than an error.
-function M.ask(text)
+-- Extract the model's text from an OpenAI-compatible chat response. "openai" is
+-- the single supported wire dialect, so every provider answers in this shape.
+local function chat_content(j)
+    if type(j) ~= "table" then return "" end
+    local c = j.choices and j.choices[1] and j.choices[1].message
+              and j.choices[1].message.content
+    if c and c ~= "" then return tostring(c) end
+    if j.text then return tostring(j.text) end
+    return ""
+end
+
+-- The ordered provider chain for a hop, or {} when the bridge is an older stub
+-- (no providers()) or the config lists none.
+local function providers(kind)
+    if rana.providers == nil then return {} end
+    return rana.providers(kind)
+end
+
+-- ask(text [, opts]) -> {action, payload}. Fuzzy pre-route skips the LLM pass
+-- entirely for a confident lexical match. `opts.cloud == false` skips every
+-- "huggingface" provider for THIS call (per-call gating). Providers are tried in
+-- order; only a TRANSPORT failure (status 0) advances to the next. A live 4xx/5xx
+-- is the upstream's own answer and stops the chain. On any failure the intent
+-- degrades to a spoken reply rather than an error.
+function M.ask(text, opts)
+    opts = opts or {}
     local routed = fuzzy.route(text)
     if routed then return routed end
 
-    local url = rana.get_llm_url()
-    if url == "" then
-        return { action = "reply", payload = "LLM endpoint is not configured." }
+    local allow_cloud = opts.cloud ~= false
+    local content, answered, external = "", false, false
+    for i, p in ipairs(providers("llm")) do
+        if p.type ~= "huggingface" or allow_cloud then
+            local ok, resp, status = rana.provider_post("llm", i, {
+                model = p.model,
+                messages = {
+                    { role = "system", content = rana.get_system_prompt() },
+                    { role = "user",   content = text },
+                },
+                temperature = 0.2,
+                max_tokens = 256,
+            })
+            if ok then
+                answered = true
+                -- Stamp the ORIGIN from the provider that answered (never from
+                -- the reply text): lib/route.lua uses it to gate which scripts
+                -- an external answer may reach.
+                external = (p.type == "huggingface")
+                content = chat_content(rana.json_decode(resp))
+                break
+            elseif status ~= nil and status ~= 0 then
+                -- The provider answered (4xx/5xx): that response is the result,
+                -- never a cue to fall through to another provider.
+                answered = true
+                rana.log("error", "llm: provider #" .. i .. " returned HTTP " .. tostring(status))
+                break
+            end
+            rana.log("info", "llm: provider #" .. i .. " (" .. tostring(p.type) ..
+                     ") unreachable, trying next")
+        end
     end
 
-    local ok, body = rana.http_post(url, {
-        model = rana.get_llm_model(),
-        messages = {
-            { role = "system", content = rana.get_system_prompt() },
-            { role = "user",   content = text },
-        },
-        temperature = 0.2,
-        max_tokens = 256,
-    })
-    if not ok then
+    -- No provider answered (none configured, all unreachable, or the only ones
+    -- left were cloud providers this call opted out of): say so. A provider that
+    -- answered 2xx (or a live 4xx/5xx) with nothing usable keeps the softer
+    -- "did not catch that" path.
+    if not answered then
         return { action = "reply", payload = "Sorry, I could not reach the language model." }
     end
 
-    local j = rana.json_decode(body)
-    local content = j and j.choices and j.choices[1] and j.choices[1].message
-                   and j.choices[1].message.content or ""
-    if content == "" then
-        content = j and j.text or ""
-    end
-
     local action, payload = M.parse_action(content)
-    return { action = action, payload = payload }
+    return { action = action, payload = payload, external = external }
 end
 
 return M

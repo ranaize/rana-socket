@@ -33,21 +33,49 @@ struct DaemonConfig {
     std::string scripts_dir;               // optional; empty => autodiscover (see resolve_scripts_dir)
 };
 
+// One entry in a hop's ordered provider chain ([[llm.provider]] / [[stt.provider]]).
+// The hop tries providers in `order`; a provider with no explicit order defaults
+// to local-before-cloud (local = 100, huggingface = 200), then keeps file order.
+// A provider answers when it returns 2xx (or a live 4xx/5xx — the upstream's own
+// answer); only a TRANSPORT failure/timeout advances to the next entry.
+struct ProviderConfig {
+    // ACL tier. "local" => http, host must already be in the scripts/init.lua
+    // allow_endpoints list. "huggingface" => https, usable only from a
+    // RANA_ENABLE_TLS build and only when [security].external_egress is true.
+    // (Routing an external answer back into a script is a separate, inbound gate
+    // — see ScriptFlag::ExternalEgress and scripts/lib/route.lua.) `type` is
+    // validated against the URL scheme so an ACL label can never contradict the
+    // wire scheme (which would let a token-bearing call slip past the gates).
+    std::string type;
+    std::string url;                  // http:// (local) or https:// (huggingface)
+    std::string model;                // request model name
+    std::string schema = "openai";    // wire dialect; only "openai" supported now
+    std::string api_key;              // bearer token; huggingface only (secret)
+    uint32_t timeout_ms = 15000;      // bounds this provider's single attempt
+    int order = 0;                    // 0 => unset (use the tier default)
+    std::string name;                 // optional log label
+};
+
 struct LlmConfig {
-    std::string url = "http://localai:8080";  // LocalAI chat endpoint base
-    std::string model = "command";            // command-routing model name
+    std::vector<ProviderConfig> providers;  // ordered ask-hop chain
 };
 
 struct SttConfig {
-    std::string url = "http://localai:8080";  // LocalAI transcription endpoint base
-    std::string model = "talk";               // whisper model name (talk.yaml)
-    uint32_t timeout_ms = 30000;
+    std::vector<ProviderConfig> providers;  // ordered STT-hop chain
+};
+
+// [security] — fleet/incident policy. external_egress=false hard-disables ALL
+// cloud fallback even when an endpoint is configured (the local endpoint
+// allowlist in init.lua is unaffected).
+struct SecurityConfig {
+    bool external_egress = true;
 };
 
 struct Config {
     DaemonConfig daemon;
     LlmConfig llm;
     SttConfig stt;
+    SecurityConfig security;
     std::set<std::string> allowed;  // [commands.allowed]: enabled script keys
     std::string path;               // path this config was loaded from
     std::string workdir;            // daemon working directory (scripts resolved here)

@@ -20,6 +20,13 @@ namespace rana {
 // integer constants in the rana.flags table so scripts can't typo them.
 enum class ScriptFlag : int {
     LongIdle = 1,  // add a generous idle/sleep budget on top of meta.timeout_ms
+    // Opt IN to being reachable by an answer that came from an external
+    // (huggingface) provider. The route tail (scripts/lib/route.lua) refuses to
+    // dispatch or relay an external answer to any script without it, so a remote
+    // model can never drive a command the operator has not opted in. Off by
+    // default; the flag is parsed here and surfaced through rana.script_metas(),
+    // where route.lua enforces it.
+    ExternalEgress = 2,
 };
 
 // ── Shared result types ────────────────────────────────────────────
@@ -144,6 +151,18 @@ public:
     uint32_t current_timeout() const;
     uint32_t current_etl_timeout() const;
 
+    // ── Provider chains ([llm.provider]/[stt.provider]) ────────────────
+    // The hop retries down this ordered list. A "local" provider is reached via
+    // the scripts/init.lua endpoint allowlist (endpoints_); a "huggingface"
+    // provider is reachable ONLY through rana.provider_post(). `tls_built()` is a
+    // compile-time constant (RANA_ENABLE_TLS).
+    static bool tls_built();
+    // Ordered providers for `kind` ("llm"/"stt"), or nullptr for an unknown kind.
+    const std::vector<ProviderConfig>* providers(const std::string& kind) const;
+    // Empty string => provider `index` (1-based) may be dialed now; otherwise a
+    // stable reason: bad_args | tls_not_built | disabled.
+    std::string provider_unavailable_reason(const std::string& kind, int index) const;
+
     // Registry mutators invoked by init.lua.
     void allow_binaries(const std::map<std::string, BinaryEntry>& m);
     void allow_endpoints(const std::vector<std::tuple<std::string, std::string, int>>& v);
@@ -181,6 +200,9 @@ private:
     std::map<std::string, BinaryEntry> binaries_;
     std::vector<Endpoint> endpoints_;
     std::map<std::string, ScriptMeta> metas_;
+
+    // The provider chain for a hop lives in cfg_ ([llm]/[stt] providers); the
+    // bearer token inside a huggingface provider is never surfaced to Lua.
 
     // Params for the script currently on the stack, used to build its cmd table.
     std::map<std::string, std::string> current_params_;

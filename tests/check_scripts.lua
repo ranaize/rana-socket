@@ -14,7 +14,7 @@ package.path = "scripts/?.lua;" .. package.path
 local function stub_rana()
     local noop = function() return true end
     return {
-        flags = { LONG_IDLE = 1 },
+        flags = { LONG_IDLE = 1, EXTERNAL_EGRESS = 2 },
         log = function() end,
         audio = { decode_to_wav = function() return "" end },
         allow_binaries = noop,
@@ -23,12 +23,10 @@ local function stub_rana()
             return { ok = false, code = -1, out = "", err = "", reason = "not_allowed" }
         end,
         http_post = function() return false, "" end,
+        providers = function() return {} end,
+        provider_post = function() return false, "", 0 end,
         json_decode = function() return nil end,
         get_system_prompt = function() return "" end,
-        get_llm_url = function() return "" end,
-        get_llm_model = function() return "" end,
-        get_stt_url = function() return "" end,
-        get_stt_model = function() return "" end,
         dispatch = function() return { status = "ok", message = "" } end,
         has_script = function() return false end,
         script_metas = function() return {} end,

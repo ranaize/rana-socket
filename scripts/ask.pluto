@@ -13,6 +13,10 @@
 --   * unknown         -> error, never forwarded.
 -- FLAG_LONG_IDLE grants extra wall-clock on top of timeout_ms (the LLM call is a
 -- slow, blocking upstream that would otherwise eat the whole Lua budget).
+-- ask does NOT gate egress itself: the outbound chain is gated by the build
+-- (--tls), the config ([security].external_egress), and lib/llm.lua, while the
+-- inbound side is gated in lib/route.lua — an answer from a "huggingface" entry
+-- may only reach scripts that declare rana.flags.EXTERNAL_EGRESS.
 -- No subprocess, no shell, no curl on the host.
 
 local rana = require("rana")
@@ -35,14 +39,17 @@ M.meta = {
 -- resolver without going through run_entrypoint (which would recurse).
 M.ask = llm.ask
 
--- Daemon-level entry: the `ask` command.
+-- Daemon-level entry: the `ask` command. A caller may set params.cloud =
+-- "false" to forbid the Hugging Face fallback for this one question; the call is
+-- otherwise gated by the build (--tls) and the [security] switch only.
 function M.execute(cmd)
     local question = cmd.target or ""
     if question == "" then question = cmd.data or "" end
     if question == "" then
         return result.invalid("no question")
     end
-    return route.route(llm.ask(question))
+    local allow_cloud = not (cmd.params and cmd.params.cloud == "false")
+    return route.route(llm.ask(question, { cloud = allow_cloud }))
 end
 
 return M
