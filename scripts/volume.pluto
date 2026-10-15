@@ -1,0 +1,64 @@
+-- scripts/volume.pluto
+-- key = "volume". Verifies the client request against rana.LuaRuntime's allowed
+-- metadata (enforced in C), then shells out to `espeak` to "speak" the result
+-- (placeholder for a real volume backend; geometry unchanged).
+
+local exec = require("lib.exec")
+local result = require("lib.result")
+local verbs = require("lib.verbs")
+
+local M = {}
+
+M.meta = {
+    name = "Volume Control",
+    description = "Set or query the system volume.",
+    actions = { "set", "get", "up", "down" },
+    keywords = { "volume", "set the volume", "mute", "volume up", "volume down" },
+    params = {
+        level = "0-100 when action=set",
+        step  = "percent step for up/down (default 5)",
+    },
+    timeout_ms = 5000,
+    examples = {
+        { action = "set", target = "50" },
+        { action = "get" },
+    },
+}
+
+-- Routed with a bare KEY? Infer the verb and operand from the words
+-- ("turn the volume up", "mute", "set it to 50").
+function M.execute(cmd)
+    local action = cmd.action
+    local arg = cmd.target or ""
+    if not action or action == "" then
+        local lvl = verbs.first_number(arg)
+        if verbs.fold(arg):match("mute") then
+            action, arg = "set", "0"
+        elseif lvl then
+            action, arg = "set", lvl
+        else
+            action = verbs.infer(arg, {
+                { verb = "up",   patterns = { "up", "louder", "raise" } },
+                { verb = "down", patterns = { "down", "quieter", "lower" } },
+            }, "get")
+        end
+    end
+    if action ~= "set" and action ~= "get" and action ~= "up" and action ~= "down" then
+        return result.error("unknown volume action: " .. tostring(action))
+    end
+
+    if action == "set" then
+        arg = tostring(arg or "")
+    else
+        arg = action
+    end
+
+    local ok, res = exec.run("espeak", "volume " .. arg)
+    if not ok then
+        return result.error(res)
+    end
+
+    return result.ok((res.out or ""):gsub("%s+$", ""))
+end
+
+return M

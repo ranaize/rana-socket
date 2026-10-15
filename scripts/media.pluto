@@ -1,0 +1,50 @@
+-- scripts/media.pluto
+-- key = "media". Media player control via the deployment's `media` backend.
+
+local exec = require("lib.exec")
+local result = require("lib.result")
+local verbs = require("lib.verbs")
+
+local M = {}
+
+M.meta = {
+    name = "Media",
+    description = "Control the media player (play/pause/next/prev/stop).",
+    actions = { "play", "pause", "next", "prev", "stop", "volume" },
+    keywords = { "media", "music", "player", "play music", "pause the music" },
+    params = { arg = "optional argument (e.g. volume level)" },
+    timeout_ms = 5000,
+    examples = {
+        { action = "pause" },
+        { action = "play" },
+    },
+}
+
+-- Routed with a bare KEY? The verb is in the words ("pause the music",
+-- "play the next song").
+function M.execute(cmd)
+    local action = cmd.action
+    local target = cmd.target or ""
+    if not action or action == "" then
+        action = verbs.infer(target, {
+            { verb = "pause", patterns = { "pause" } },
+            { verb = "stop",  patterns = { "stop" } },
+            { verb = "next",  patterns = { "next" } },
+            { verb = "prev",  patterns = { "previous", "prev" } },
+        }, "play")
+        target = ""
+    end
+    local args = { action }
+    if target ~= "" then
+        table.insert(args, target)
+    end
+
+    local ok, res = exec.run("media", table.unpack(args))
+    if not ok then
+        return result.error(res)
+    end
+
+    return result.ok("media " .. action)
+end
+
+return M

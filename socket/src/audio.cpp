@@ -3,7 +3,6 @@
 #include <cstdint>
 
 namespace rana {
-namespace serializer {
 namespace audio {
 namespace {
 
@@ -57,5 +56,4 @@ bool decode_to_wav(const std::string& raw, const std::string& encoding,
 }
 
 }  // namespace audio
-}  // namespace serializer
 }  // namespace rana

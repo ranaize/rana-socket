@@ -1,0 +1,48 @@
+-- scripts/mc_server.pluto
+-- key = "mc_server". Manage a Minecraft server container via docker.
+
+local exec = require("lib.exec")
+local result = require("lib.result")
+local verbs = require("lib.verbs")
+
+local M = {}
+
+M.meta = {
+    name = "Minecraft Server",
+    description = "Start/stop/restart/status a Minecraft server container.",
+    actions = { "start", "stop", "restart", "status" },
+    keywords = { "minecraft", "mc server", "minecraft server" },
+    params = {},
+    timeout_ms = 15000,
+    examples = {
+        { action = "start" },
+        { action = "status" },
+    },
+}
+
+-- Routed with a bare KEY? Infer the verb from the spoken words
+-- ("start the minecraft server", "stop the mc server", "restart minecraft").
+-- The container is FIXED ("mc-server") — the docker surface is the hardcoded
+-- minecraft_* entries in init.lua, never freeform args.
+function M.execute(cmd)
+    local action = cmd.action
+    if not action or action == "" then
+        action = verbs.infer(cmd.target, {
+            { verb = "restart", patterns = { "restart" } },
+            { verb = "stop",    patterns = { "stop", "halt" } },
+            { verb = "status",  patterns = { "status", "check" } },
+        }, "start")
+    end
+    if action ~= "start" and action ~= "stop" and action ~= "restart" and action ~= "status" then
+        return result.error("unknown mc_server action: " .. tostring(action))
+    end
+
+    local ok, res = exec.run("minecraft_" .. action)
+    if not ok then
+        return result.error(res)
+    end
+
+    return result.ok(res.out or "")
+end
+
+return M

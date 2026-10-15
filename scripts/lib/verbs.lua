@@ -1,0 +1,37 @@
+-- scripts/lib/verbs.lua
+--
+-- Shared free-text verb inference for the multi-verb scripts (power, mc_server,
+-- media, lights, volume). When a command is routed by KEY rather than action
+-- (fuzzy/LLM emit the key), the verb lives in the spoken words, not cmd.action —
+-- so every one of those scripts needs the same "fold the words, then match the
+-- first pattern that fits" logic. Keeping it here means one normalization rule
+-- and one first-match-wins ordering, instead of five hand-rolled if-chains.
+local M = {}
+
+-- Normalize spoken text for matching: lowercase, and fold runs of
+-- whitespace/hyphens into a single space so "shut down", "shut-down" and
+-- "shutdown" all read as "shut down".
+function M.fold(s)
+    return (s or ""):lower():gsub("[%s%-]+", " ")
+end
+
+-- Ordered first-match inference. `rules` is an array of
+--   { verb = "<action>", patterns = { "<lua pattern>", ... } }
+-- matched against M.fold(text); the first rule with any matching pattern wins,
+-- otherwise `default` is returned.
+function M.infer(text, rules, default)
+    local t = M.fold(text)
+    for _, rule in ipairs(rules) do
+        for _, pat in ipairs(rule.patterns) do
+            if t:match(pat) then return rule.verb end
+        end
+    end
+    return default
+end
+
+-- First run of digits in `text`, or nil (volume "set it to 50").
+function M.first_number(text)
+    return string.match(text or "", "%d+")
+end
+
+return M

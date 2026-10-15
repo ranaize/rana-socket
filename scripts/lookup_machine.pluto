@@ -1,0 +1,36 @@
+-- scripts/lookup_machine.pluto
+-- key = "lookup_machine". Resolve a hostname/role to a machine address via the
+-- deployment's `lookup` backend, then returns the answer as plain text.
+
+local exec = require("lib.exec")
+local result = require("lib.result")
+
+local M = {}
+
+M.meta = {
+    name = "Lookup Machine",
+    description = "Resolve a machine name or role to its address.",
+    actions = { "lookup" },
+    keywords = { "lookup", "find the ip", "ip of", "address of", "machine" },
+    params = { name = "machine name or role (target)" },
+    timeout_ms = 5000,
+    examples = {
+        { action = "lookup", target = "nas" },
+    },
+}
+
+function M.execute(cmd)
+    local name = cmd.target or ""
+    if name == "" then
+        return result.error("missing name")
+    end
+
+    local ok, res = exec.run("lookup", name)
+    if not ok then
+        return result.error(res)
+    end
+
+    return result.ok((res.out or ""):gsub("%s+$", ""))
+end
+
+return M

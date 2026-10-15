@@ -8,7 +8,10 @@ version = "0.1.0"
 description = "Type-safe FlatBuffers clients for the rana-socketd daemon"
 requires-python = ">=3.11"
 dependencies = [
-    "flatbuffers>=24.3",
+    # MUST match the flatc version that generates command_generated.py
+    # (premake gen_schema_daemon / host flatc). The Python runtime API surface
+    # is version-locked to the generator; a mismatch breaks vectors of tables.
+    "flatbuffers==25.12.19",
 ]
 
 [tool.setuptools.packages.find]

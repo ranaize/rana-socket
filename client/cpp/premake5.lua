@@ -16,9 +16,8 @@ project "rana-socket-client"
     includedirs {
         client_gen_dir,
         ROOT .. "/client/cpp/src",
-        ROOT .. "/serializer/src",
         fb_include
     }
 
-    links { "rana-serializer", "pthread" }
+    links { "pthread" }
     gen_schema_client()

@@ -1,0 +1,68 @@
+-- scripts/power.pluto
+-- key = "power". Host power management via the fixed-argv sudo entries
+-- (shutdown/reboot/suspend in init.lua).
+
+local exec = require("lib.exec")
+local result = require("lib.result")
+local verbs = require("lib.verbs")
+
+local M = {}
+
+M.meta = {
+    name = "Power",
+    description = "Host power management (shutdown/reboot/suspend).",
+    actions = { "shutdown", "reboot", "suspend" },
+    keywords = {
+        "shutdown", "shut down", "power off", "power down", "reboot",
+        "restart the computer", "suspend", "sleep",
+    },
+    -- Danger: matched ONLY on an exact phrase ("shutdown", "power off", ...) so
+    -- a partial sentence like "shutdown the minecraft server" can never land
+    -- here (it routes to mc_server instead).
+    danger = true,
+    params = {},
+    timeout_ms = 5000,
+    examples = {
+        { action = "suspend" },
+        { action = "reboot" },
+    },
+}
+
+-- When routed without a verb (fuzzy/LLM emit the KEY, not the action), infer it
+-- from the spoken words, e.g. "shut down", "restart", "go to sleep".
+function M.execute(cmd)
+    local action = cmd.action
+    if not action or action == "" then
+        action = verbs.infer(cmd.target, {
+            { verb = "shutdown", patterns = { "shut[%w%s]-down", "power[%w%s]-down",
+                                              "shutdown", "power[%w%s]-off" } },
+            { verb = "reboot",   patterns = { "reboot", "restart" } },
+            { verb = "suspend",  patterns = { "suspend", "sleep" } },
+        }, nil)
+        if not action then
+            -- Never guess-and-suspend: an unrecognized power request fails closed.
+            return result.error("unrecognized power request")
+        end
+    end
+    if action ~= "shutdown" and action ~= "reboot" and action ~= "suspend" then
+        return result.error("unknown power action: " .. tostring(action))
+    end
+
+    -- Destructive: the client confirms out of band and sets params.confirm
+    -- ("true"). An unconfirmed request (e.g. one routed by voice through ask)
+    -- fails closed rather than shutting the machine down implicitly.
+    if not (cmd.params and cmd.params.confirm) then
+        return result.safety("power " .. action .. " requires confirmation")
+    end
+
+    -- Fixed argv-backed verbs (init.lua entries shutdown/reboot/suspend run sudo -n
+    -- with hardcoded arguments); we only pick the entry name, never args.
+    local ok, res = exec.run(action)
+    if not ok then
+        return result.error(res)
+    end
+
+    return result.ok("power " .. action)
+end
+
+return M

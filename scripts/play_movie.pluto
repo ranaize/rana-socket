@@ -1,0 +1,36 @@
+-- scripts/play_movie.pluto
+-- key = "play_movie". Stream a movie to the TV via the deployment's `movie` backend.
+
+local exec = require("lib.exec")
+local result = require("lib.result")
+
+local M = {}
+
+M.meta = {
+    name = "Play Movie",
+    description = "Play a movie/stream on the TV.",
+    actions = { "play", "stop" },
+    keywords = { "movie", "film", "movie on", "play movie", "netflix", "stream" },
+    params = { url = "media URL or title (target)" },
+    timeout_ms = 15000,
+    examples = {
+        { action = "play", target = "http://media.local/movie.mkv" },
+    },
+}
+
+function M.execute(cmd)
+    local action = cmd.action or "play"
+    local what = cmd.target or ""
+    if what == "" then
+        return result.error("missing url/title")
+    end
+
+    local ok, res = exec.run("movie", action, what)
+    if not ok then
+        return result.error(res)
+    end
+
+    return result.ok(action .. " " .. what)
+end
+
+return M

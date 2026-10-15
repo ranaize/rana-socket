@@ -1,0 +1,103 @@
+-- scripts/stt.pluto
+-- In-process speech-to-text hop. Replaces scripts/rana-stt.sh. talk.pluto calls it
+-- via rana.dispatch("stt", "stt", wav); it posts the WAV to the configured STT
+-- provider and returns the transcript. It is NOT edge-addressable (not in any
+-- [commands.allowed]) — scripts reach it in-process regardless, as a hop.
+-- FLAG_LONG_IDLE grants it extra wall-clock on top of timeout_ms (STT is a slow,
+-- blocking upstream call). Egress to a "huggingface" provider is gated by the
+-- build (--tls) and [security].external_egress, not by a script flag; the
+-- bridge owns the destination and the bearer token (the script never sees
+-- either). The transcript it returns is further gated when ask routes it.
+
+local rana = require("rana")
+local multipart = require("lib.multipart")
+
+local M = {}
+
+M.meta = {
+    name = "Speech-to-text",
+    description = "Transcribe a WAV via the configured STT provider.",
+    actions = { "stt" },
+    timeout_ms = 30000,
+    flags = { rana.flags.LONG_IDLE },
+}
+
+local function clip(s, n)
+    if #s > (n or 2000) then
+        return string.sub(s, 1, (n or 2000)) .. "..."
+    end
+    return s
+end
+
+-- The ordered provider chain for a hop, or {} when the bridge is an older stub
+-- (no providers()) or the config lists none.
+local function providers(kind)
+    if rana.providers == nil then return {} end
+    return rana.providers(kind)
+end
+
+-- OpenAI-compatible transcription needs BOTH a `file` and a `model` form field;
+-- lib/multipart builds that body. "openai" is the single supported wire dialect,
+-- so every provider takes this same body.
+local function transcribe_body(model, wav)
+    return multipart.build({
+        { name = "model", value = model },
+        { name = "file", filename = "request.wav", content_type = "audio/wav", value = wav },
+    })
+end
+
+-- stt(wav, allow_cloud) -> transcript ("" on failure).
+--
+-- Providers are tried in order; only a TRANSPORT failure (status 0 — unreachable,
+-- timeout, or a refused huggingface gate) advances to the next. A live 4xx/5xx is
+-- the upstream's own answer and stops the chain. `allow_cloud == false` opts THIS
+-- call out of every "huggingface" provider.
+function M.stt(wav, allow_cloud)
+    if not wav or #wav == 0 then
+        rana.log("error", "stt: empty wav payload")
+        return ""
+    end
+
+    for i, p in ipairs(providers("stt")) do
+        if p.type ~= "huggingface" or allow_cloud ~= false then
+            local model = (p.model ~= nil and p.model ~= "") and p.model or "talk"
+            local body, ctype = transcribe_body(model, wav)
+            rana.log("debug", "stt: provider #" .. i .. " (" .. tostring(p.type) ..
+                     ", model=" .. model .. ", wav=" .. #wav .. " bytes)")
+            -- Third return is the HTTP status (0 == transport failure or a gate
+            -- refusal). Only that may advance to the next provider — never a live
+            -- 4xx/5xx, which is the upstream's own answer.
+            local ok, resp, status = rana.provider_post("stt", i, body, { ["Content-Type"] = ctype })
+            if ok then
+                local j = rana.json_decode(resp)
+                if j and j.text then
+                    local text = tostring(j.text)
+                    rana.log("debug", "stt: transcript (" .. #text .. " chars): " .. clip(text, 500))
+                    return text
+                end
+                rana.log("error", "stt: no text in response (" .. #resp .. " bytes): " .. clip(resp))
+                return ""
+            elseif status ~= nil and status ~= 0 then
+                rana.log("error", "stt: provider #" .. i .. " answered status " .. tostring(status) ..
+                         " -> " .. clip(tostring(resp)))
+                return ""
+            end
+            rana.log("info", "stt: provider #" .. i .. " unreachable, trying next")
+        end
+    end
+    return ""
+end
+
+-- Daemon-level entry: `stt` is not edge-addressable, but the hop lands here with
+-- the WAV in cmd.target (dispatched binary-safe) or cmd.data. A caller can set
+-- cmd.params.cloud = "false" to forbid a huggingface provider for this call.
+function M.execute(cmd)
+    local wav = cmd.target
+    if (wav == nil or #wav == 0) and cmd.data ~= nil and #cmd.data > 0 then
+        wav = cmd.data
+    end
+    local allow_cloud = not (cmd.params and cmd.params.cloud == "false")
+    return M.stt(wav or "", allow_cloud)
+end
+
+return M

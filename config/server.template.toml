@@ -1,46 +1,90 @@
-# rana-deploy rana-socket config — container world (canonical default).
-# Mounted read-only into the rana-socketd container at /etc/rana/rana-socket.toml
-# (see rana-deploy/docker-compose.yaml). Command set is a superset of the
-# bare-metal notebook config: it keeps the host-tied commands
-# (mc_server/power/play_movie/lookup_machine) AND adds the re-dispatch targets
-# (speak/lights/browser) the ask hop routes into. The host-tied commands need
-# container-available equivalents before they run here; speak/lights/browser
-# need their executors present in the image (espeak-ng, rana-lights.sh, xdg-open).
+# rana-deploy rana-socket config — host daemon (canonical default).
+# Run NATIVELY on the host by `make server` (rana-deploy/Makefile): the daemon
+# binds TCP :9000 on the host and reaches LocalAI via the host-published 8080.
+#
+# Scriptable command model (the design is in the socket/scripts + socket/src
+# sources; see scripts/ask.pluto and scripts/talk.pluto for the hop piping):
+#   - [commands.allowed] is the registry. A key is addressable ONLY if it is
+#     listed here AND a matching scripts/<key>.pluto exists (cross-checked by the
+#     daemon at startup).
+#   - `ask` and `talk` are scripts like any other (scripts/ask.pluto,
+#     scripts/talk.pluto → scripts/stt.pluto); ask/talk/stt are in-process
+#     Pluto hops, not shell scripts. The daemon owns all LocalAI/STT calls.
+#   - Each script self-describes (meta) and the actual executables it may reach
+#     are whitelisted in scripts/init.lua, not here.
 
 [daemon]
 socket_type = "tcp"
 bind_address = "0.0.0.0"
 port = 9000
-# The bridge subnet LocalAI + socketd share (rana_server_net). The daemon only
-# accepts frames from these peers; everything else is closed on accept.
-allowed_ips = ["172.28.0.0/16"]
+# scripts_dir is optional: when omitted the daemon autodiscovers it (walks up from
+# its own binary, then /opt/rana/scripts). Override via the RANA_SCRIPTS_DIR env var.
+# Peers allowed to connect to the TCP door. The daemon closes (on accept) any
+# peer not listed here — a rejected client shows up as a "Broken pipe" on its
+# first send. 127.0.0.1 plus typical LAN subnets cover the notebook agent
+# (via host.docker.internal) reaching the host's :9000. Tighten to your network.
+allowed_ips = ["127.0.0.1", "172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"]
 
-[commands.mc_server]
-variant = "McServerCmd"
-type = "docker_compose"
-workdir = "/opt/minecraft"
-default_world = "survival"
+# The command registry. Order does not matter.
+[commands.allowed]
+"ask"             = true
+"talk"            = true
+"power"           = true
+"mc_server"       = true
+"lookup_machine"  = true
 
-# [commands.power]
-# variant = "PowerCmd"
-# type = "system"
-# binary = "/usr/bin/dinitctl"
-# suspend_binary = "/usr/bin/zzz"
-# requires_confirm = true
-
-# The daemon is the ONLY LocalAI caller. AskCmd.text rides here to the ask hop
-# script over the socket en route to localai:8080 (ASK_LLM_URL).
-[commands.ask]
-variant = "AskCmd"
-type = "script"
-path = "/usr/local/bin/rana-ask.sh"
-# TEXT passed via argv, never a shell.
+# The daemon is the ONLY LocalAI caller. Each hop is an ORDERED provider chain:
+# entries are tried top to bottom, and only a TRANSPORT failure/timeout from one
+# advances to the next (a live 4xx/5xx is the upstream's own answer and stops the
+# chain). `order` is optional; with none given the default is local-first
+# (local = 100, huggingface = 200), then file order.
+#
+#   type   = "local" | "huggingface"  ACL tier; MUST match the URL scheme
+#   url    = http:// for local (the host must be in scripts/init.lua's
+#            allow_endpoints), https:// for huggingface (--tls build)
+#   schema = "openai" (default; the only supported wire dialect —
+#            /v1/chat/completions + /v1/audio/transcriptions)
+#   model  = request model name
+#   api_key= bearer token; huggingface only, injected by the daemon, never
+#            visible to scripts (and rejected on a cleartext local provider)
+[llm]
+[[llm.provider]]
+type       = "local"
+url        = "http://127.0.0.1:8080/v1/chat/completions"
+model      = "command"
 timeout_ms = 30000
 
-# On-server STT for TalkCmd. The daemon decodes the audio (libranasocketaudio)
-# to a WAV and hands it to this hop; the transcript is routed through the ask hop.
+# Hugging Face fallback (optional; requires a --tls build + [security]
+# external_egress). Reached only when the local entry above is UNREACHABLE. Its
+# ANSWER is stamped "external", and scripts/lib/route.lua will only route such an
+# answer into a script that opts in with rana.flags.EXTERNAL_EGRESS (off by
+# default), so a remote model can never reach, e.g., power.
+# [[llm.provider]]
+# type       = "huggingface"
+# url        = "https://api-inference.huggingface.co/models/<org>/<model>"
+# model      = "<org>/<model>"
+# api_key    = "hf_..."
+# timeout_ms = 15000
+
+# On-server STT for TalkCmd. The daemon decodes the audio to a WAV and hands it to
+# scripts/stt.pluto, which POSTs it to the first reachable provider here.
 [stt]
-script = "/usr/local/bin/rana-stt.sh"
-url = "http://localai:8080"
-model = "talk"
+[[stt.provider]]
+type       = "local"
+url        = "http://127.0.0.1:8080/v1/audio/transcriptions"
+model      = "talk"
 timeout_ms = 30000
+
+# Hugging Face fallback (see [llm] above; same gating).
+# [[stt.provider]]
+# type       = "huggingface"
+# url        = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
+# model      = "openai/whisper-large-v3"
+# api_key    = "hf_..."
+# timeout_ms = 15000
+
+# Fleet/incident policy. external_egress=false hard-disables EVERY huggingface
+# provider even when one is configured; the local endpoint allowlist in
+# scripts/init.lua is unaffected.
+[security]
+external_egress = true
